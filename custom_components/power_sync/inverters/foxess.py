@@ -19,8 +19,6 @@ from .base import InverterController, InverterState, InverterStatus
 
 _LOGGER = logging.getLogger(__name__)
 
-TRACE = 5
-logging.addLevelName(TRACE, "TRACE")
 
 # pymodbus 3.10+ renamed 'slave' to 'device_id'
 def _detect_slave_kwarg() -> str:
@@ -461,14 +459,13 @@ class FoxESSController(InverterController):
         """Write a single holding register."""
         if not self._client or not self._connected:
             return False
-        if _LOGGER.isEnabledFor(TRACE):
+        if _LOGGER.isEnabledFor(logging.DEBUG):
             caller_frame = inspect.currentframe().f_back
             caller_name = caller_frame.f_code.co_name
             method = getattr(type(self), caller_name, None)
             doc = inspect.getdoc(method) if method else None
             intent = f" — {doc.split(chr(10))[0]}" if doc else ""
-            _LOGGER.log(
-                TRACE,
+            _LOGGER.debug(
                 "Modbus WRITE  reg=%d  val=%d (0x%04X)  caller=%s%s",
                 address, value, value, caller_name, intent,
             )
@@ -488,15 +485,14 @@ class FoxESSController(InverterController):
         """Write multiple holding registers."""
         if not self._client or not self._connected:
             return False
-        if _LOGGER.isEnabledFor(TRACE):
+        if _LOGGER.isEnabledFor(logging.DEBUG):
             caller_frame = inspect.currentframe().f_back
             caller_name = caller_frame.f_code.co_name
             method = getattr(type(self), caller_name, None)
             doc = inspect.getdoc(method) if method else None
             intent = f" — {doc.split(chr(10))[0]}" if doc else ""
             vals_fmt = ", ".join(f"{v} (0x{v:04X})" for v in values)
-            _LOGGER.log(
-                TRACE,
+            _LOGGER.debug(
                 "Modbus WRITE  reg=%d  vals=[%s]  caller=%s%s",
                 address, vals_fmt, caller_name, intent,
             )
