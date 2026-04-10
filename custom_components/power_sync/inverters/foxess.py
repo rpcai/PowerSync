@@ -19,6 +19,7 @@ from .base import InverterController, InverterState, InverterStatus
 
 _LOGGER = logging.getLogger(__name__)
 
+
 # pymodbus 3.10+ renamed 'slave' to 'device_id'
 def _detect_slave_kwarg() -> str:
     """Detect the correct keyword argument for the Modbus slave/device ID."""
