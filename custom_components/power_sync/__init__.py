@@ -16227,6 +16227,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if mode == "charge":
                     force_charge_state["active"] = True
                     force_charge_state["expires_at"] = expires_at
+                    force_charge_state["duration"] = persisted_force_state.get("duration", int(remaining_minutes))
                     force_charge_state["source"] = persisted_force_state.get("source", "user")
                     force_charge_state["saved_tariff"] = persisted_force_state.get("saved_tariff")
                     force_charge_state["saved_operation_mode"] = persisted_force_state.get("saved_operation_mode")
@@ -16268,6 +16269,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 elif mode == "discharge":
                     force_discharge_state["active"] = True
                     force_discharge_state["expires_at"] = expires_at
+                    force_discharge_state["duration"] = persisted_force_state.get("duration", int(remaining_minutes))
                     force_discharge_state["source"] = persisted_force_state.get("source", "user")
                     force_discharge_state["saved_tariff"] = persisted_force_state.get("saved_tariff")
                     force_discharge_state["saved_operation_mode"] = persisted_force_state.get("saved_operation_mode")
@@ -16342,6 +16344,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             duration = DEFAULT_DISCHARGE_DURATION
 
         source = call.data.get("source", "user")
+        extend_hardware = call.data.get("_extend_hardware", False)
+
+        # Hardware extension: optimizer is extending an active force discharge.
+        # Only re-issue Modbus writes to reset the inverter's hardware timer.
+        if extend_hardware and force_discharge_state.get("active"):
+            entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            power_w = call.data.get("power_w", 0)
+            foxess_coord = entry_data.get("foxess_coordinator")
+            if foxess_coord:
+                await foxess_coord.force_discharge(duration, power_w=power_w)
+                _LOGGER.debug(f"FoxESS force discharge hardware extended ({duration}min, {power_w}W)")
+                return
+            sig_coord = entry_data.get("sigenergy_coordinator")
+            if sig_coord:
+                from .inverters.sigenergy import SigenergyController
+                controller = SigenergyController(sig_coord.client)
+                power_kw = power_w / 1000 if power_w > 0 else 10.0
+                await controller.force_discharge(power_kw=power_kw)
+                await controller.disconnect()
+                _LOGGER.debug(f"Sigenergy force discharge hardware extended ({duration}min)")
+                return
+            sungrow_coord = entry_data.get("sungrow_coordinator")
+            if sungrow_coord:
+                await sungrow_coord.force_discharge(duration, power_w=power_w)
+                _LOGGER.debug(f"Sungrow force discharge hardware extended ({duration}min)")
+                return
+            goodwe_coord = entry_data.get("goodwe_coordinator")
+            if goodwe_coord:
+                await goodwe_coord.force_discharge(duration, power_w=power_w)
+                _LOGGER.debug(f"GoodWe force discharge hardware extended ({duration}min)")
+                return
+            _LOGGER.warning("_extend_hardware: no coordinator found, falling through to full handler")
+
         _LOGGER.info(f"🔋 FORCE DISCHARGE: Activating for {duration} minutes (source={source})")
 
         # Set force discharge state IMMEDIATELY so the optimizer sees it
@@ -16349,6 +16384,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         was_already_force_discharging = force_discharge_state.get("active", False)
         force_discharge_state["active"] = True
         force_discharge_state["source"] = source
+        force_discharge_state["duration"] = duration
 
         # Check if this is a Sigenergy system
         is_sigenergy = bool(entry.data.get(CONF_SIGENERGY_STATION_ID))
@@ -16442,6 +16478,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if discharge_result:
                     force_discharge_state["active"] = True
                     force_discharge_state["source"] = source
+                    force_discharge_state["duration"] = duration
                     force_discharge_state["expires_at"] = dt_util.utcnow() + timedelta(minutes=duration)
                     _LOGGER.info(f"FoxESS FORCE DISCHARGE ACTIVE for {duration} minutes (power_w={power_w})")
 
@@ -17014,6 +17051,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             duration = DEFAULT_DISCHARGE_DURATION
 
         source = call.data.get("source", "user")
+        extend_hardware = call.data.get("_extend_hardware", False)
+
+        # Hardware extension: optimizer is extending an active force charge.
+        # Only re-issue Modbus writes to reset the inverter's hardware timer.
+        # Skip all state management, timer setup, and dispatcher signals —
+        # the optimizer coordinator manages those.
+        if extend_hardware and force_charge_state.get("active"):
+            entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            power_w = call.data.get("power_w", 0)
+            foxess_coord = entry_data.get("foxess_coordinator")
+            if foxess_coord:
+                await foxess_coord.force_charge(duration, power_w=power_w)
+                _LOGGER.debug(f"FoxESS force charge hardware extended ({duration}min, {power_w}W)")
+                return
+            sig_coord = entry_data.get("sigenergy_coordinator")
+            if sig_coord:
+                from .inverters.sigenergy import SigenergyController
+                controller = SigenergyController(sig_coord.client)
+                power_kw = power_w / 1000 if power_w > 0 else 10.0
+                await controller.force_charge(power_kw=power_kw)
+                await controller.disconnect()
+                _LOGGER.debug(f"Sigenergy force charge hardware extended ({duration}min)")
+                return
+            sungrow_coord = entry_data.get("sungrow_coordinator")
+            if sungrow_coord:
+                await sungrow_coord.force_charge(duration, power_w=power_w)
+                _LOGGER.debug(f"Sungrow force charge hardware extended ({duration}min)")
+                return
+            goodwe_coord = entry_data.get("goodwe_coordinator")
+            if goodwe_coord:
+                await goodwe_coord.force_charge(duration, power_w=power_w)
+                _LOGGER.debug(f"GoodWe force charge hardware extended ({duration}min)")
+                return
+            # Fallback: no coordinator found, proceed with full handler
+            _LOGGER.warning("_extend_hardware: no coordinator found, falling through to full handler")
+
         _LOGGER.info(f"🔌 FORCE CHARGE: Activating for {duration} minutes (source={source})")
 
         # Block force charge during demand peak periods (grid charging must stay off)
@@ -17038,6 +17111,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         was_already_force_charging = force_charge_state.get("active", False)
         force_charge_state["active"] = True
         force_charge_state["source"] = source
+        force_charge_state["duration"] = duration
 
         # Check if this is a Sigenergy system
         is_sigenergy = bool(entry.data.get(CONF_SIGENERGY_STATION_ID))
@@ -17149,6 +17223,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if charge_result:
                     force_charge_state["active"] = True
                     force_charge_state["source"] = source
+                    force_charge_state["duration"] = duration
                     force_charge_state["expires_at"] = dt_util.utcnow() + timedelta(minutes=duration)
                     _LOGGER.info(f"FoxESS FORCE CHARGE ACTIVE for {duration} minutes (power_w={power_w})")
 
@@ -17711,13 +17786,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry_data["restore_cooldown_until"] = cooldown_until
             _LOGGER.info("User-initiated restore — optimizer force actions suppressed until %s", cooldown_until.isoformat())
 
-        # Check if optimizer is active — suppress routine notifications
+        # Check if optimizer is active (and not in monitoring mode) — suppress routine notifications
         # (optimizer transitions between force modes frequently; AEMO spikes have their own notification)
+        # Monitoring mode doesn't execute actions, so notifications should still fire.
         suppress_notification = False
         entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
         opt_coordinator = entry_data.get("optimization_coordinator")
         if opt_coordinator and getattr(opt_coordinator, '_enabled', False):
-            suppress_notification = True
+            monitoring_mode = entry.options.get(
+                CONF_MONITORING_MODE, entry.data.get(CONF_MONITORING_MODE, False)
+            )
+            if not monitoring_mode:
+                suppress_notification = True
 
         # Cancel any pending expiry timers (discharge and charge)
         if force_discharge_state.get("cancel_expiry_timer"):

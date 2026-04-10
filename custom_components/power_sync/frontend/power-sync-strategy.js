@@ -1001,6 +1001,7 @@ function _teslaStyleFlow(e, hass) {
     entities: {
       solar_power: e('solar_power'),
       grid_power: e('grid_power'),
+      grid_status: e('grid_status'),
       battery_power: e('battery_power'),
       load_power: e('home_load'),
       battery_level: e('battery_level'),

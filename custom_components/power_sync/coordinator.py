@@ -1359,6 +1359,9 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
         self._energy_acc = EnergyAccumulator(hass, "tesla")
         self._firmware = None  # Extracted from site_info gateways
 
+        # Grid status tracking (off-grid / islanding detection)
+        self._last_grid_status: str = "Active"  # "Active" or "Islanded"
+
         # Tesla server outage tracking
         self._consecutive_failures: int = 0
         self._outage_notified: bool = False
@@ -1461,12 +1464,45 @@ class TeslaEnergyCoordinator(DataUpdateCoordinator):
                 except Exception:
                     pass  # Non-critical, don't fail the update
 
+            # Grid status: "Active" (on-grid) or "Islanded" (off-grid/blackout)
+            grid_status = live_status.get("grid_status", "Active")
+
+            # Detect grid status transitions and send push notifications
+            prev_status = self._last_grid_status
+            if grid_status != prev_status:
+                self._last_grid_status = grid_status
+                try:
+                    from .automations.actions import _send_expo_push
+                    if grid_status == "Islanded":
+                        _LOGGER.warning(
+                            "Grid outage detected — Powerwall islanding (site %s)",
+                            self.site_id,
+                        )
+                        await _send_expo_push(
+                            self.hass,
+                            "Grid Outage Detected",
+                            "Your Powerwall is running off-grid (islanded). Grid power is unavailable.",
+                        )
+                    else:
+                        _LOGGER.info(
+                            "Grid restored — Powerwall back on-grid (site %s)",
+                            self.site_id,
+                        )
+                        await _send_expo_push(
+                            self.hass,
+                            "Grid Power Restored",
+                            "Grid power has been restored. Your Powerwall is back on-grid.",
+                        )
+                except Exception:
+                    pass
+
             energy_data = {
                 "solar_power": solar_kw,
                 "grid_power": grid_kw,
                 "battery_power": battery_kw,
                 "load_power": load_kw,
                 "battery_level": live_status.get("percentage_charged", 0),
+                "grid_status": grid_status,
                 "ev_power": ev_power_kw,
                 "last_update": dt_util.utcnow(),
                 "energy_summary": self._energy_acc.as_dict(),

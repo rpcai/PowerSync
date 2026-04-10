@@ -28,6 +28,7 @@
         status: {
           inactive: 'INATTIVO',
           connected: 'CONNESSA',
+          off_grid: 'FUORI RETE',
           consuming: 'IN CONSUMO',
           waiting: 'IN ATTESA',
           off: 'OFF',
@@ -93,6 +94,7 @@
         status: {
           inactive: 'IDLE',
           connected: 'CONNECTED',
+          off_grid: 'OFF GRID',
           consuming: 'CONSUMING',
           waiting: 'STANDBY',
           off: 'OFF',
@@ -158,6 +160,7 @@
         status: {
           inactive: 'INACTIVO',
           connected: 'CONECTADA',
+          off_grid: 'SIN RED',
           consuming: 'CONSUMIENDO',
           waiting: 'EN ESPERA',
           off: 'OFF',
@@ -223,6 +226,7 @@
         status: {
           inactive: 'INACTIF',
           connected: 'CONNECTE',
+          off_grid: 'HORS RÉSEAU',
           consuming: 'CONSOMMATION',
           waiting: 'EN ATTENTE',
           off: 'OFF',
@@ -288,6 +292,7 @@
         status: {
           inactive: 'INAKTIV',
           connected: 'VERBUNDEN',
+          off_grid: 'NETZGETRENNT',
           consuming: 'VERBRAUCH',
           waiting: 'BEREIT',
           off: 'OFF',
@@ -1905,6 +1910,23 @@
         } else {
           this._setText('#flow-battery-status', '');
           batteryStatusEl.style.display = 'none';
+        }
+      }
+
+      // Grid status: off-grid / islanding detection
+      const gridStatusEl = this.shadowRoot.querySelector('#flow-grid-status');
+      if (gridStatusEl) {
+        const gridStatusEntity = cfg.entities.grid_status;
+        const gridStatusState = gridStatusEntity ? this._entityState(gridStatusEntity) : null;
+        const isOffGrid = gridStatusState && gridStatusState.state === 'Islanded';
+        if (isOffGrid) {
+          this._setText('#flow-grid-status', this._t('card.status.off_grid', 'OFF GRID'));
+          gridStatusEl.style.fill = '#ff5d73';
+          gridStatusEl.style.display = 'inline';
+        } else {
+          this._setText('#flow-grid-status', this._t('card.status.connected', 'CONNECTED'));
+          gridStatusEl.style.fill = '';
+          gridStatusEl.style.display = 'inline';
         }
       }
 

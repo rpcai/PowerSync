@@ -38,7 +38,7 @@ class BatteryControllerWrapper:
         self.hass = hass
         self.battery_system = battery_system
 
-    async def force_charge(self, duration_minutes: int = 60, power_w: float = 5000) -> bool:
+    async def force_charge(self, duration_minutes: int = 60, power_w: float = 5000, _extend_hardware: bool = False) -> bool:
         """
         Command battery to charge.
 
@@ -55,9 +55,12 @@ class BatteryControllerWrapper:
         try:
             _LOGGER.info(f"🔋 Optimizer: Force charge {duration_minutes}min at {power_w}W")
 
+            service_data = {"duration": duration_minutes, "power_w": power_w, "source": "optimizer"}
+            if _extend_hardware:
+                service_data["_extend_hardware"] = True
             await self.hass.services.async_call(
                 "power_sync", "force_charge",
-                {"duration": duration_minutes, "power_w": power_w, "source": "optimizer"},
+                service_data,
                 blocking=True,
             )
             return True
@@ -66,7 +69,7 @@ class BatteryControllerWrapper:
             _LOGGER.error(f"Force charge failed: {e}", exc_info=True)
             return False
 
-    async def force_discharge(self, duration_minutes: int = 60, power_w: float = 5000) -> bool:
+    async def force_discharge(self, duration_minutes: int = 60, power_w: float = 5000, _extend_hardware: bool = False) -> bool:
         """
         Command battery to discharge.
 
@@ -83,9 +86,12 @@ class BatteryControllerWrapper:
         try:
             _LOGGER.info(f"🔋 Optimizer: Force discharge {duration_minutes}min at {power_w}W")
 
+            service_data = {"duration": duration_minutes, "power_w": power_w, "source": "optimizer"}
+            if _extend_hardware:
+                service_data["_extend_hardware"] = True
             await self.hass.services.async_call(
                 "power_sync", "force_discharge",
-                {"duration": duration_minutes, "power_w": power_w, "source": "optimizer"},
+                service_data,
                 blocking=True,
             )
             return True

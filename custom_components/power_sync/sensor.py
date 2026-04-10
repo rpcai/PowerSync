@@ -35,6 +35,7 @@ from .const import (
     SENSOR_TYPE_CURRENT_EXPORT_PRICE,
     SENSOR_TYPE_SOLAR_POWER,
     SENSOR_TYPE_GRID_POWER,
+    SENSOR_TYPE_GRID_STATUS,
     SENSOR_TYPE_BATTERY_POWER,
     SENSOR_TYPE_HOME_LOAD,
     SENSOR_TYPE_BATTERY_LEVEL,
@@ -266,6 +267,12 @@ ENERGY_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=3,
         value_fn=lambda data: data.get("grid_power") if data else None,
+    ),
+    PowerSyncSensorEntityDescription(
+        key=SENSOR_TYPE_GRID_STATUS,
+        name="Grid Status",
+        icon="mdi:transmission-tower",
+        value_fn=lambda data: data.get("grid_status", "Active") if data else None,
     ),
     PowerSyncSensorEntityDescription(
         key=SENSOR_TYPE_BATTERY_POWER,
