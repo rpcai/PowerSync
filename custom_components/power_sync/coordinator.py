@@ -3184,6 +3184,14 @@ class FoxESSEnergyCoordinator(DataUpdateCoordinator):
 
         self._energy_acc = EnergyAccumulator(hass, "foxess")
 
+        # Serialise all Modbus access so that data polls (every 30s) can't
+        # clobber an in-progress force charge/discharge.  Without this, the
+        # data poll's connect() closes the TCP connection that force charge
+        # opened, causing the reg=46003 write to fail silently (the
+        # _connected=False guard fires before the DEBUG log, so no WRITE or
+        # verify log appears — just "write failed on attempt N/3").
+        self._modbus_lock = asyncio.Lock()
+
         super().__init__(
             hass,
             _LOGGER,
@@ -3196,7 +3204,7 @@ class FoxESSEnergyCoordinator(DataUpdateCoordinator):
         if not self._energy_acc._last_update:
             await self._energy_acc.async_restore()
         try:
-            async with self._controller:
+            async with self._modbus_lock, self._controller:
                 status = await self._controller.get_status()
                 energy_summary = await self._controller.get_energy_summary()
 
@@ -3269,7 +3277,7 @@ class FoxESSEnergyCoordinator(DataUpdateCoordinator):
             power_w: Charge power in watts. If 0, reads max_charge_current from
                      the inverter and uses that (respects user's FoxESS app setting).
         """
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             if power_w <= 0 and self.data:
                 # Use inverter's configured max charge current (set via FoxESS app)
                 max_charge_a = self.data.get("max_charge_current_a")
@@ -3288,7 +3296,7 @@ class FoxESSEnergyCoordinator(DataUpdateCoordinator):
             power_w: Discharge power in watts. If 0, reads max_discharge_current from
                      the inverter and uses that (respects user's FoxESS app setting).
         """
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             if power_w <= 0 and self.data:
                 # Use inverter's configured max discharge current (set via FoxESS app)
                 max_discharge_a = self.data.get("max_discharge_current_a")
@@ -3301,37 +3309,37 @@ class FoxESSEnergyCoordinator(DataUpdateCoordinator):
 
     async def restore_normal(self) -> bool:
         """Restore FoxESS to normal (Self Use) operation."""
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             return await self._controller.restore_normal()
 
     async def set_backup_reserve(self, percent: int) -> bool:
         """Set minimum SOC (backup reserve)."""
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             return await self._controller.set_backup_reserve(percent)
 
     async def set_backup_mode(self) -> bool:
         """Set FoxESS to Backup mode (IDLE — prevents self-consumption discharge)."""
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             return await self._controller.set_backup_mode()
 
     async def restore_work_mode_from_idle(self) -> bool:
         """Restore work mode to Self Use after IDLE Backup mode."""
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             return await self._controller.restore_work_mode_from_idle()
 
     async def set_work_mode(self, mode: int) -> bool:
         """Set FoxESS work mode."""
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             return await self._controller.set_work_mode(mode)
 
     async def set_charge_rate_limit(self, amps: float) -> bool:
         """Set maximum charge current in amps."""
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             return await self._controller.set_charge_rate_limit(amps)
 
     async def set_discharge_rate_limit(self, amps: float) -> bool:
         """Set maximum discharge current in amps."""
-        async with self._controller:
+        async with self._modbus_lock, self._controller:
             return await self._controller.set_discharge_rate_limit(amps)
 
     async def async_shutdown(self) -> None:
