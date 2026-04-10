@@ -3185,7 +3185,7 @@ class FoxESSEnergyCoordinator(DataUpdateCoordinator):
         self._energy_acc = EnergyAccumulator(hass, "foxess")
 
         # Serialise all Modbus access so that data polls (every 30s) can't
-        # clobber an in-progress force charge/discharge.  Without this, the
+        # clobber an in-progress force charge/discharge. Without this, the
         # data poll's connect() closes the TCP connection that force charge
         # opened, causing the reg=46003 write to fail silently (the
         # _connected=False guard fires before the DEBUG log, so no WRITE or
