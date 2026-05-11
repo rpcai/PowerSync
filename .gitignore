@@ -51,3 +51,8 @@ temp/
 
 # Build artifacts
 VERSION
+
+# Local dev/session files (not for upstream)
+CHANGELOG.md
+CLAUDE.md
+scripts/link_dev.sh
