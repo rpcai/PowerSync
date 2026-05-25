@@ -183,3 +183,68 @@ def test_free_window_buffer_adds_headroom(battery_optimizer_module):
     # Buffer adds ~10% capacity headroom above the no-buffer ceiling (~0.311).
     assert peak_soc >= 0.38, f"Buffer not applied: peak SoC {peak_soc:.3f} below ~0.411"
     assert peak_soc < 0.55, f"LP over-charged even with buffer: {peak_soc:.3f}"
+
+
+def test_profit_max_lifts_ceiling_by_downstream_demand(battery_optimizer_module):
+    """In profit_max, free-window ceiling = target + demand to pre_window_slot.
+
+    Regression test for the post-target paid-charge bug: when profit_max is
+    on, the LP was capping free-window charging at exactly pre_window_soc_target
+    (e.g. 95%), so the LP had to top up at paid grid-import rates to maintain
+    target SoC against load between the free window and the pre_window_slot.
+    With the fix, the ceiling becomes target + demand_to_target/(cap*eff),
+    eliminating the need for paid charging.
+    """
+    pytest.importorskip("scipy")
+
+    # 3h free (0c) → 4h paid (34c) → pre_window_slot, then 1h post-target.
+    # Battery: 48 kWh, max charge 14.9 kW, eff 0.92, backup_reserve 0.35.
+    # Load 0.6 kW constant, no solar.
+    # target = 0.95, demand 14:00-18:00 = 4h × 0.6 kW = 2.4 kWh
+    # Lifted ceiling = 0.95 + 2.4 / (48 * 0.92) = 0.95 + 0.054 = 1.004 → clipped to 1.0
+    n_per_hour = 12
+    free_slots = 3 * n_per_hour   # 36, 11:00-14:00
+    paid_slots = 4 * n_per_hour   # 48, 14:00-18:00 (pre-window range)
+    post_slots = 1 * n_per_hour   # 12, 18:00-19:00 (after target deadline)
+    n = free_slots + paid_slots + post_slots
+
+    opt = _optimizer(
+        battery_optimizer_module,
+        capacity_wh=48000,
+        max_charge_w=14900,
+        max_discharge_w=12500,
+        backup_reserve=0.35,
+        horizon_hours=8,
+    )
+    opt.pre_window_slot = free_slots + paid_slots   # base-slot index of target (18:00)
+    opt.pre_window_soc_target = 0.95
+
+    result = opt.optimize(
+        import_prices=[0.0] * free_slots + [0.341] * paid_slots + [0.484] * post_slots,
+        export_prices=[0.0] * n,
+        solar_forecast=[0.0] * n,
+        load_forecast=[0.6] * n,
+        current_soc=0.41,
+        acquisition_cost_kwh=0.0,
+    )
+
+    assert result.feasible
+
+    free_window = result.schedule.actions[:free_slots]
+    paid_window = result.schedule.actions[free_slots:free_slots + paid_slots]
+
+    peak_free_soc = max(a.soc for a in free_window)
+    # The fix: free-window peak should be at-or-near 100% (target 95% + 5.4% demand cover).
+    assert peak_free_soc >= 0.97, (
+        f"Profit-max ceiling not lifted by downstream demand: "
+        f"free-window peak SoC {peak_free_soc:.3f} < 0.97"
+    )
+
+    # And there should be NO paid-window charging — the free window covers it all.
+    paid_charge_kwh = sum(
+        (a.battery_charge_w or 0.0) * 5 / 60 / 1000 for a in paid_window
+    )
+    assert paid_charge_kwh < 0.5, (
+        f"Profit-max still scheduled {paid_charge_kwh:.2f} kWh of paid charging; "
+        f"expected ~0 (free window should cover all)"
+    )

@@ -656,6 +656,11 @@ def test_charge_block_mask_prevents_greedy_fallback_charging(
     assert all(action.action != "charge" for action in blocked.schedule.actions)
 
 
+@pytest.mark.skip(
+    reason="Incompatible with our per-free-window SoC ceiling feature (Feature 2). "
+    "Upstream's greedy full-fill during 0c windows is the behaviour we deliberately "
+    "removed; this test asserts that old behaviour."
+)
 def test_charge_block_mask_overrides_free_import_force_charge(
     battery_optimizer_module,
 ):
@@ -692,6 +697,11 @@ def test_charge_block_mask_overrides_free_import_force_charge(
     assert all(action.action != "charge" for action in blocked.schedule.actions)
 
 
+@pytest.mark.skip(
+    reason="Incompatible with our per-free-window SoC ceiling feature (Feature 2). "
+    "Upstream's greedy full-fill during 0c windows is the behaviour we deliberately "
+    "removed; this test asserts that old behaviour."
+)
 def test_zerohero_free_import_window_reports_continuous_force_charge(
     battery_optimizer_module,
 ):
@@ -728,6 +738,11 @@ def test_zerohero_free_import_window_reports_continuous_force_charge(
     assert result.schedule.charge_w[free_start:free_start + free_slots] == [12000] * 36
 
 
+@pytest.mark.skip(
+    reason="Incompatible with our per-free-window SoC ceiling feature (Feature 2). "
+    "Upstream's greedy full-fill during 0c windows is the behaviour we deliberately "
+    "removed; this test asserts that old behaviour."
+)
 def test_zerohero_free_import_before_positive_fit_schedules_export(
     battery_optimizer_module,
 ):
