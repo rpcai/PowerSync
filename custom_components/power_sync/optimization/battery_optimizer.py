@@ -728,14 +728,44 @@ class BatteryOptimizer:
             )
             # Profit-max mode: if this free window sits before the pre-window
             # SOC floor target (e.g. Flow Power Happy Hour fill-by time), lift
-            # the ceiling so the LP can fill to pre_window_soc_target here at 0c
-            # rather than paying grid-import rates between window and target.
+            # the ceiling so the LP can fill to (target + downstream demand)
+            # here at 0c rather than topping up at paid grid-import rates
+            # between this window and the target. The downstream demand range
+            # is from this window's end to the NEXT free window OR
+            # pre_window_slot, whichever comes first — so we don't pre-charge
+            # for demand that the next free window can cover.
             if (
                 self.pre_window_slot is not None
                 and self.pre_window_soc_target > 0.0
                 and periods[_wb].end <= self.pre_window_slot
             ):
-                _ceiling = max(_ceiling, self.pre_window_soc_target)
+                _pre_window_period = self._period_index_for_base_slot(
+                    periods, self.pre_window_slot
+                )
+                _demand_end = min(_next, _pre_window_period)
+                _demand_to_target_kwh = sum(
+                    max(0.0, (p_load[_p] - p_solar[_p]) * p_dt[_p])
+                    for _p in range(_wb + 1, _demand_end)
+                )
+                # Divide by eff so charge input is large enough to net the
+                # target SoC after discharge efficiency losses.
+                _profit_max_ceiling = min(
+                    1.0,
+                    self.pre_window_soc_target
+                    + _demand_to_target_kwh / (cap * eff),
+                )
+                _ceiling = max(_ceiling, _profit_max_ceiling)
+                _LOGGER.debug(
+                    "Free-window profit-max ceiling: window_period=[%d,%d] "
+                    "(base slots %d-%d), target=%.1f%%, "
+                    "downstream_demand_to_target=%.2fkWh, "
+                    "lifted_ceiling=%.1f%%",
+                    _wa, _wb,
+                    periods[_wa].start, periods[_wb].end,
+                    self.pre_window_soc_target * 100,
+                    _demand_to_target_kwh,
+                    _profit_max_ceiling * 100,
+                )
             # When the plan starts inside this free window the LP has no prior
             # periods in which to discharge — clamp at soc_0 so the ceiling
             # cannot demand an impossible same-window SoC drop.
