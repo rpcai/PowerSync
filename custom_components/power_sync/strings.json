@@ -340,7 +340,8 @@
           "optimization_spread_import_enabled": "Spread import across window",
           "profit_max_enabled": "Enable Profit Max",
           "profit_max_target_time": "Profit Max target time",
-          "profit_max_target_soc": "Profit Max target SOC"
+          "profit_max_target_soc": "Profit Max target SOC",
+          "factor_automation_exports": "Inhibit Optimizer Exports"
         },
         "data_description": {
           "optimization_provider": "Smart Optimization uses an LP solver to minimise costs. Native mode uses your battery's built-in TOU scheduler.",
@@ -357,7 +358,8 @@
           "optimization_spread_import_enabled": "When enabled on supported batteries, Smart Optimization spreads planned grid charging across each same-price import window instead of using maximum charge power.",
           "profit_max_enabled": "Let Smart Optimization prioritise profitable export opportunities instead of holding battery charge for later by default.",
           "profit_max_target_time": "HH:MM time for Profit Max to reach the configured target SOC before the export window. Default 17:15.",
-          "profit_max_target_soc": "Battery SOC Profit Max should target before the export window. Default 100%."
+          "profit_max_target_soc": "Battery SOC Profit Max should target before the export window. Default 100%.",
+          "factor_automation_exports": "When enabled, the optimizer plans no battery→grid exports. All force-discharge is handled by your time-based automations which run unconditionally. Automation export windows are treated as load demand — the optimizer charges exactly enough to cover house consumption and your automation export obligation, avoiding unnecessary over-charging during free import periods. Only daily, time-triggered, every-day force-discharge automations are included. Detected windows are logged at INFO level."
         },
         "submit": "Next"
       },
@@ -1170,7 +1172,8 @@
           "optimization_spread_import_enabled": "Spread import across window",
           "profit_max_enabled": "Enable Profit Max",
           "profit_max_target_time": "Profit Max target time",
-          "profit_max_target_soc": "Profit Max target SOC"
+          "profit_max_target_soc": "Profit Max target SOC",
+          "factor_automation_exports": "Inhibit Optimizer Exports"
         },
         "data_description": {
           "optimization_provider": "Smart Optimization uses an LP solver to minimise costs. Native mode uses your battery's built-in TOU scheduler.",
@@ -1187,7 +1190,8 @@
           "optimization_spread_import_enabled": "When enabled on supported batteries, Smart Optimization spreads planned grid charging across each same-price import window instead of using maximum charge power.",
           "profit_max_enabled": "Let Smart Optimization prioritise profitable export opportunities instead of holding battery charge for later by default.",
           "profit_max_target_time": "HH:MM time for Profit Max to reach the configured target SOC before the export window. Default 17:15.",
-          "profit_max_target_soc": "Battery SOC Profit Max should target before the export window. Default 100%."
+          "profit_max_target_soc": "Battery SOC Profit Max should target before the export window. Default 100%.",
+          "factor_automation_exports": "When enabled, the optimizer plans no battery→grid exports. All force-discharge is handled by your time-based automations which run unconditionally. Automation export windows are treated as load demand — the optimizer charges exactly enough to cover house consumption and your automation export obligation, avoiding unnecessary over-charging during free import periods. Only daily, time-triggered, every-day force-discharge automations are included. Detected windows are logged at INFO level."
         },
         "submit": "Save"
       },
