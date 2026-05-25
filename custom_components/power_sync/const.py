@@ -1229,6 +1229,20 @@ DEFAULT_EXPORT_BOOST_START = "17:00"
 DEFAULT_EXPORT_BOOST_END = "21:00"
 DEFAULT_EXPORT_BOOST_THRESHOLD = 0.0  # c/kWh (0 = always apply boost)
 
+# Daily automation export overlay (legacy manual config — superseded by CONF_FACTOR_AUTOMATION_EXPORTS)
+CONF_DAILY_EXPORT_TARGET_KWH = "daily_export_target_kwh"
+CONF_DAILY_EXPORT_START_TIME = "daily_export_start_time"
+CONF_DAILY_EXPORT_END_TIME = "daily_export_end_time"
+DEFAULT_DAILY_EXPORT_TARGET_KWH = 0.0
+DEFAULT_DAILY_EXPORT_START_TIME = "18:00"
+DEFAULT_DAILY_EXPORT_END_TIME = "20:00"
+
+# Auto-detection of daily force-discharge automations from the PowerSync store.
+# When enabled: (1) automation window discharge is added as load obligation so the LP
+# charges enough to cover it; (2) LP-driven battery exports are blocked in those windows.
+CONF_FACTOR_AUTOMATION_EXPORTS = "factor_automation_exports"
+
+
 # Chip Mode configuration
 # Inverse of Export Boost - prevents exports unless price exceeds threshold
 # Useful for overnight stability while still capturing price spikes

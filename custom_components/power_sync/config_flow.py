@@ -373,6 +373,7 @@ from .const import (
     CONF_PROFIT_MAX_TARGET_TIME,
     CONF_PROFIT_MAX_TARGET_SOC,
     CONF_OPTIMIZATION_SPREAD_IMPORT_ENABLED,
+    CONF_FACTOR_AUTOMATION_EXPORTS,
     COST_FUNCTION_COST,
     DEFAULT_OPTIMIZATION_BACKUP_RESERVE,
     DEFAULT_PROFIT_MAX_TARGET_TIME,
@@ -2149,6 +2150,9 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         user_input.get(CONF_PROFIT_MAX_TARGET_SOC),
                         DEFAULT_PROFIT_MAX_TARGET_SOC,
                     ),
+                    CONF_FACTOR_AUTOMATION_EXPORTS: bool(
+                        user_input.get(CONF_FACTOR_AUTOMATION_EXPORTS, False)
+                    ),
                 })
             # Proceed to battery connection setup
             return await self._route_to_battery_setup()
@@ -2275,6 +2279,10 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             mode=NumberSelectorMode.SLIDER,
                         )
                     ),
+                    vol.Optional(
+                        CONF_FACTOR_AUTOMATION_EXPORTS,
+                        default=False,
+                    ): BooleanSelector(),
                 }
             ),
             description_placeholders={},
@@ -6487,6 +6495,10 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 new_options[CONF_PROFIT_MAX_TARGET_TIME] = profit_max_target_time
                 new_data[CONF_PROFIT_MAX_TARGET_SOC] = profit_max_target_soc
                 new_options[CONF_PROFIT_MAX_TARGET_SOC] = profit_max_target_soc
+                new_data[CONF_FACTOR_AUTOMATION_EXPORTS] = bool(
+                    user_input.get(CONF_FACTOR_AUTOMATION_EXPORTS, False)
+                )
+                new_options[CONF_FACTOR_AUTOMATION_EXPORTS] = new_data[CONF_FACTOR_AUTOMATION_EXPORTS]
 
             self.hass.config_entries.async_update_entry(
                 self.config_entry, data=new_data, options=new_options
@@ -6593,6 +6605,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 ),
             ),
             DEFAULT_PROFIT_MAX_TARGET_SOC,
+        )
+        current_factor_automation_exports = bool(
+            self._get_option(CONF_FACTOR_AUTOMATION_EXPORTS, False)
         )
 
         opt_providers = _optimization_provider_options_for_battery(battery_system)
@@ -6703,6 +6718,10 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     min=0, max=100, step=1, unit_of_measurement="%",
                     mode=NumberSelectorMode.SLIDER,
                 )),
+                vol.Optional(
+                    CONF_FACTOR_AUTOMATION_EXPORTS,
+                    default=current_factor_automation_exports,
+                ): BooleanSelector(),
             }
         )
 

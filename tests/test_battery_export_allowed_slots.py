@@ -144,6 +144,7 @@ def _install_power_sync_stubs() -> None:
         "goodwe", "sigenergy", "sungrow", "foxess",
         "alphaess", "solax", "fronius_reserva", "neovolt",
     }
+    const_module.CONF_FACTOR_AUTOMATION_EXPORTS = "factor_automation_exports"
     sys.modules["power_sync.const"] = const_module
 
     battery_module = types.ModuleType("power_sync.optimization.battery_optimizer")
@@ -2281,3 +2282,294 @@ def test_tesla_force_extension_skips_reupload_when_tariff_window_covers_expiry(o
 
     assert battery.force_discharge_calls == []
     assert force_state["expires_at"] == datetime(2026, 5, 3, 8, 50, tzinfo=timezone.utc)
+# ---------------------------------------------------------------------------
+# Automation export logic
+# ---------------------------------------------------------------------------
+
+def _automation_coordinator(opt_module, **options):
+    """Build a coordinator pre-configured for automation export testing.
+
+    Sets battery capacity and optimizer stub so _apply_automation_export_power
+    can run its SoC recalculation pass without hitting AttributeErrors.
+    """
+    coord = _coordinator(opt_module, "amber", **options)
+    coord._cached_automation_segments = None
+    coord._config.battery_capacity_wh = 47900
+    coord._config.backup_reserve = 0.2
+    coord._optimizer = SimpleNamespace(efficiency=0.92)
+    return coord
+
+
+def test_parse_automation_segments_returns_empty_when_cache_is_none(opt_module):
+    coordinator = _automation_coordinator(opt_module)
+    assert coordinator._parse_automation_export_segments() == []
+
+
+def test_parse_automation_segments_returns_populated_cache(opt_module):
+    coordinator = _automation_coordinator(opt_module)
+    segments = [(18, 0, 20, 0, 5000.0, "Force Discharge 5.0kw")]
+    coordinator._cached_automation_segments = segments
+    assert coordinator._parse_automation_export_segments() == segments
+
+
+def test_get_automation_export_allowed_slots_marks_window(opt_module):
+    """Slots spanning 18:00–20:00 should be True; all others False.
+
+    Stub ha_dt.now returns 2026-05-03 08:30 UTC.
+    18:00 is 570 min ahead → slot 114; 20:00 is 690 min ahead → slot 138 (exclusive).
+    """
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [(18, 0, 20, 0, 5000.0, "Test")]
+
+    slots = coordinator._get_automation_export_allowed_slots(288)
+
+    assert _true_indexes(slots) == list(range(114, 138))
+
+
+def test_get_automation_export_allowed_slots_two_segments(opt_module):
+    """Each automation segment contributes its own window of True slots."""
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [
+        (18, 0, 20, 0, 5000.0, "Force Discharge 5.0kw"),
+        (20, 0, 21, 0, 500.0, "Evening Discharge 0.5kw"),
+    ]
+
+    slots = coordinator._get_automation_export_allowed_slots(288)
+
+    # 18:00→slot 114, 21:00→slot 150
+    assert _true_indexes(slots) == list(range(114, 150))
+
+
+def test_apply_automation_export_power_fills_full_window(opt_module):
+    """All non-charge slots in the automation window become export at configured power."""
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [(18, 0, 20, 0, 5000.0, "Test")]
+
+    base = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+    # Mix of self_consumption and one existing export at a different (LP) power
+    actions = [
+        opt_module.ScheduleAction(
+            timestamp=base + idx * timedelta(minutes=5),
+            action="export" if idx == 0 else "self_consumption",
+            power_w=12000.0 if idx == 0 else 0.0,
+            soc=0.80,
+            battery_charge_w=0.0,
+            battery_discharge_w=12000.0 if idx == 0 else 0.0,
+        )
+        for idx in range(24)  # 18:00–19:55 (24 × 5-min slots)
+    ]
+    schedule = opt_module.OptimizationSchedule(
+        actions=actions, predicted_cost=0, predicted_savings=0
+    )
+
+    result = coordinator._apply_automation_export_power(schedule, len(actions))
+
+    assert all(a.action == "export" for a in result.actions)
+    assert all(a.power_w == 5000.0 for a in result.actions)
+    assert all(a.battery_discharge_w == 5000.0 for a in result.actions)
+    assert all(a.battery_charge_w == 0.0 for a in result.actions)
+
+
+def test_apply_automation_export_power_preserves_charge_slots(opt_module):
+    """Charge slots within the automation window are left unchanged."""
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [(18, 0, 20, 0, 5000.0, "Test")]
+
+    base = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+    actions = [
+        opt_module.ScheduleAction(
+            timestamp=base + idx * timedelta(minutes=5),
+            action="charge" if idx == 2 else "self_consumption",
+            power_w=6000.0 if idx == 2 else 0.0,
+            soc=0.70,
+            battery_charge_w=6000.0 if idx == 2 else 0.0,
+            battery_discharge_w=0.0,
+        )
+        for idx in range(6)
+    ]
+    schedule = opt_module.OptimizationSchedule(
+        actions=actions, predicted_cost=0, predicted_savings=0
+    )
+
+    result = coordinator._apply_automation_export_power(schedule, len(actions))
+
+    assert result.actions[2].action == "charge"
+    assert result.actions[2].power_w == 6000.0
+    for idx in range(6):
+        if idx != 2:
+            assert result.actions[idx].action == "export"
+            assert result.actions[idx].power_w == 5000.0
+
+
+def test_apply_automation_export_power_uses_per_segment_power(opt_module):
+    """Two consecutive automation segments each pin their own wattage."""
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [
+        (18, 0, 20, 0, 5000.0, "Force Discharge 5.0kw"),
+        (20, 0, 21, 0, 500.0, "Evening Discharge 0.5kw"),
+    ]
+
+    base = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+    actions = [
+        opt_module.ScheduleAction(
+            timestamp=base + idx * timedelta(minutes=5),
+            action="self_consumption",
+            power_w=0.0,
+            soc=0.80,
+            battery_charge_w=0.0,
+            battery_discharge_w=0.0,
+        )
+        for idx in range(36)  # 18:00–20:55
+    ]
+    schedule = opt_module.OptimizationSchedule(
+        actions=actions, predicted_cost=0, predicted_savings=0
+    )
+
+    result = coordinator._apply_automation_export_power(schedule, len(actions))
+
+    # 18:00–19:55: 24 slots at 5 kW
+    for i in range(24):
+        assert result.actions[i].power_w == 5000.0, f"slot {i} power"
+        assert result.actions[i].battery_discharge_w == 5000.0
+    # 20:00–20:55: 12 slots at 0.5 kW
+    for i in range(24, 36):
+        assert result.actions[i].power_w == 500.0, f"slot {i} power"
+        assert result.actions[i].battery_discharge_w == 500.0
+
+
+def test_apply_automation_export_power_recalculates_soc_trajectory(opt_module):
+    """SoC is recalculated forward using the LP formula after power pinning."""
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [(18, 0, 20, 0, 5000.0, "Test")]
+
+    base = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+    actions = [
+        opt_module.ScheduleAction(
+            timestamp=base + idx * timedelta(minutes=5),
+            action="self_consumption",
+            power_w=0.0,
+            soc=0.80,  # stale LP SoC — should be fully recomputed after pinning
+            battery_charge_w=0.0,
+            battery_discharge_w=0.0,
+        )
+        for idx in range(3)
+    ]
+    schedule = opt_module.OptimizationSchedule(
+        actions=actions, predicted_cost=0, predicted_savings=0
+    )
+
+    result = coordinator._apply_automation_export_power(schedule, len(actions))
+
+    # Replicate the LP formula: soc += (charge*eff - discharge/eff)*dt/cap
+    cap_kwh = 47.9
+    eff = 0.92
+    dt_h = 5 / 60
+    backup = 0.2
+    soc = 0.80
+    expected = []
+    for _ in range(3):
+        new_soc = max(backup, min(1.0, soc + (-5.0 / eff) * dt_h / cap_kwh))
+        expected.append(round(new_soc, 4))
+        soc = new_soc
+
+    for i, exp in enumerate(expected):
+        assert result.actions[i].soc == pytest.approx(exp, abs=0.0001), f"slot {i} soc"
+
+
+def test_apply_automation_export_power_returns_unchanged_when_no_segments(opt_module):
+    """With no automation segments the original schedule is returned as-is."""
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = []
+
+    base = datetime(2026, 5, 3, 18, 0, tzinfo=timezone.utc)
+    actions = [
+        opt_module.ScheduleAction(
+            timestamp=base + idx * timedelta(minutes=5),
+            action="self_consumption",
+            power_w=0.0,
+            soc=0.90,
+            battery_charge_w=0.0,
+            battery_discharge_w=0.0,
+        )
+        for idx in range(4)
+    ]
+    schedule = opt_module.OptimizationSchedule(
+        actions=actions, predicted_cost=0, predicted_savings=0
+    )
+
+    result = coordinator._apply_automation_export_power(schedule, len(actions))
+
+    assert result is schedule  # exact same object — no copy made
+
+
+def test_should_spread_export_schedule_suppressed_when_automation_exports_active(opt_module):
+    """Spread export must be disabled when CONF_FACTOR_AUTOMATION_EXPORTS is True.
+
+    The automation pin already fills the window at the configured power level;
+    spread export output would be immediately overwritten and must not run.
+    """
+    coordinator = _coordinator(
+        opt_module, "amber", factor_automation_exports=True
+    )
+    coordinator.battery_system = "goodwe"
+    coordinator._config.spread_export_enabled = True
+
+    assert coordinator._should_spread_export_schedule() is False
+
+
+def test_should_spread_export_schedule_active_when_automation_exports_off(opt_module):
+    """When automation exports are disabled, spread export decision falls through to normal logic."""
+    coordinator = _coordinator(
+        opt_module, "amber", factor_automation_exports=False
+    )
+    coordinator.battery_system = "goodwe"
+    coordinator._config.spread_export_enabled = True
+
+    assert coordinator._should_spread_export_schedule() is True
+
+
+def test_get_automation_export_cap_w_returns_power_for_window_slots(opt_module):
+    """Window slots get automation power (W); non-window slots get 1e6 sentinel.
+
+    Stub now=08:30 → 18:00 is slot 114, 20:00 is slot 138 (exclusive).
+    """
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [(18, 0, 20, 0, 5000.0, "Force Discharge 5.0kw")]
+
+    cap_w = coordinator._get_automation_export_cap_w(288)
+
+    assert all(cap_w[i] == 5000.0 for i in range(114, 138)), "Window slots should have 5000 W cap"
+    assert all(cap_w[i] == 1e6 for i in range(0, 114)), "Pre-window slots should be uncapped"
+    assert all(cap_w[i] == 1e6 for i in range(138, 288)), "Post-window slots should be uncapped"
+
+
+def test_inhibit_exports_load_overlay_adds_automation_power(opt_module):
+    """Option B load overlay: automation window slots have extra_kw added to load_forecast.
+
+    Uses _get_automation_export_allowed_slots + _get_automation_export_cap_w directly,
+    mirroring the coordinator CFAE block, to verify the load overlay math.
+    Stub now=08:30 → 18:00–20:00 window = slots 114–137 (24 slots × 5 kW × 5/60 h = 10 kWh).
+    """
+    coordinator = _automation_coordinator(opt_module)
+    coordinator._cached_automation_segments = [(18, 0, 20, 0, 5000.0, "Force Discharge 5.0kw")]
+
+    n = 288
+    load_forecast = [0.8] * n
+    auto_slots = coordinator._get_automation_export_allowed_slots(n)
+    auto_cap_w = coordinator._get_automation_export_cap_w(n)
+
+    dt_h = coordinator._config.interval_minutes / 60.0
+    extra_kwh = 0.0
+    for i, is_window in enumerate(auto_slots):
+        if is_window and i < len(auto_cap_w) and auto_cap_w[i] < 1e5:
+            extra_kw = auto_cap_w[i] / 1000.0
+            load_forecast[i] += extra_kw
+            extra_kwh += extra_kw * dt_h
+
+    assert all(abs(load_forecast[i] - 5.8) < 1e-9 for i in range(114, 138)), \
+        "Window slots: 0.8 kW house + 5.0 kW automation = 5.8 kW"
+    assert all(abs(load_forecast[i] - 0.8) < 1e-9 for i in range(0, 114)), \
+        "Pre-window slots unchanged"
+    assert all(abs(load_forecast[i] - 0.8) < 1e-9 for i in range(138, 288)), \
+        "Post-window slots unchanged"
+    assert abs(extra_kwh - 10.0) < 1e-9, "24 slots × 5 kW × 5/60 h = 10 kWh obligation"

@@ -178,6 +178,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._optimizer: BatteryOptimizer | None = None
         self._last_optimizer_result: OptimizerResult | None = None
 
+        # Cached automation export segments — refreshed async before each LP run
+        # to avoid blocking the event loop with synchronous file I/O.
+        self._cached_automation_segments: list[tuple] | None = None
+
         # Data collection components
         self._load_estimator: LoadEstimator | None = None
         self._solar_forecaster: SolcastForecaster | None = None
@@ -1852,10 +1856,39 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if self._optimizer.pre_window_slot is not None
                 else 0.0
             )
+            # Refresh automation segments async before any synchronous helpers
+            # (_get_automation_export_allowed_slots, _apply_automation_export_power)
+            # consume them, so those never need to do blocking file I/O.
+            await self._refresh_automation_segments()
+
             battery_export_allowed = self._battery_export_allowed_slots(
                 len(import_prices),
                 export_prices,
             )
+            from ..const import CONF_FACTOR_AUTOMATION_EXPORTS as _CFAE
+            if self._entry and self._entry.options.get(_CFAE, False):
+                # "Inhibit Optimizer Exports": LP plans no battery→grid exports.
+                # All force-discharge is handled by unconditional time-based automations.
+                # Block LP battery export for all slots; overlay automation window power
+                # as extra load so the LP charges enough to cover house + export obligation.
+                battery_export_allowed = [False] * len(import_prices)
+
+                auto_slots = self._get_automation_export_allowed_slots(len(import_prices))
+                auto_cap_w = self._get_automation_export_cap_w(len(import_prices))
+                dt_h = self._config.interval_minutes / 60.0
+                extra_kwh = 0.0
+                for i, is_window in enumerate(auto_slots):
+                    if is_window and i < len(auto_cap_w) and auto_cap_w[i] < 1e5:
+                        extra_kw = auto_cap_w[i] / 1000.0
+                        if i < len(load_forecast):
+                            load_forecast[i] += extra_kw
+                            extra_kwh += extra_kw * dt_h
+                if extra_kwh > 0:
+                    _LOGGER.debug(
+                        "Automation export obligation: %.1f kWh added as load demand across horizon",
+                        extra_kwh,
+                    )
+
             battery_charge_blocked = self._battery_charge_blocked_slots(
                 len(import_prices),
             )
@@ -1897,6 +1930,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._current_schedule = self._spread_export_schedule(
                     self._current_schedule,
                     battery_export_allowed,
+                )
+                result.schedule = self._current_schedule
+            # Pin export power in automation window slots to automation-defined
+            # levels. Runs last so it overrides spread-export if both are active.
+            from ..const import CONF_FACTOR_AUTOMATION_EXPORTS as _CFAE2
+            if self._entry and self._entry.options.get(_CFAE2, False):
+                self._current_schedule = self._apply_automation_export_power(
+                    self._current_schedule,
+                    len(import_prices),
                 )
                 result.schedule = self._current_schedule
             self._last_update_time = dt_util.now()
@@ -2939,7 +2981,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return allowed
 
     def _should_spread_export_schedule(self) -> bool:
-        """Return True when optimizer export actions should be flattened."""
+        """Return True when optimizer export actions should be flattened.
+
+        Spread export is suppressed when automation-export factoring is active:
+        the automation pin already fills each window at the configured power level,
+        making spread export redundant (and its output would be immediately overwritten).
+        """
+        from ..const import CONF_FACTOR_AUTOMATION_EXPORTS
+        if self._entry and self._entry.options.get(CONF_FACTOR_AUTOMATION_EXPORTS, False):
+            return False
         return (
             self._config.spread_export_enabled
             and self._supports_target_export_power()
@@ -5193,6 +5243,306 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return ev_load
 
+    async def _refresh_automation_segments(self) -> None:
+        """Read the automations store in an executor thread and cache the result.
+
+        Called once at the start of each optimization cycle so the synchronous
+        post-processing helpers (_parse_automation_export_segments etc.) never
+        have to do blocking file I/O on the event loop thread.
+        """
+        import json
+        import os
+        from ..const import CONF_FACTOR_AUTOMATION_EXPORTS
+
+        if not self._entry or not self._entry.options.get(CONF_FACTOR_AUTOMATION_EXPORTS, False):
+            self._cached_automation_segments = []
+            return
+
+        store_path = self.hass.config.path(".storage", "power_sync.automations")
+
+        def _read() -> list[tuple]:
+            if not os.path.exists(store_path):
+                return []
+            try:
+                with open(store_path) as f:
+                    store = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                _LOGGER.warning("Automation export overlay: failed to read store: %s", exc)
+                return []
+
+            automations = store.get("data", {}).get("automations", [])
+            all_days = {"0", "1", "2", "3", "4", "5", "6"}
+
+            def _round5(h: int, m: int) -> tuple[int, int]:
+                total = round((h * 60 + m) / 5) * 5
+                return divmod(total % (24 * 60), 60)
+
+            segments: list[tuple] = []
+            for auto in automations:
+                if not isinstance(auto, dict):
+                    continue
+                if not auto.get("enabled", False) or auto.get("paused", False) or auto.get("run_once", False):
+                    continue
+                trigger = auto.get("trigger", {})
+                if trigger.get("trigger_type") != "time":
+                    continue
+                repeat = set(str(trigger.get("repeat_days", "")).split(","))
+                if not all_days.issubset(repeat):
+                    continue
+                time_str = trigger.get("time_of_day", "")
+                try:
+                    th, tm = (int(x) for x in time_str.split(":"))
+                except (ValueError, AttributeError):
+                    continue
+                sh, sm = _round5(th, tm)
+                name = auto.get("name", "?")
+                for action in auto.get("actions", []):
+                    if action.get("action_type") != "force_discharge":
+                        continue
+                    params = action.get("parameters", {})
+                    dur_min = params.get("duration_minutes", 0)
+                    power_w = params.get("power_w", 0)
+                    if dur_min <= 0 or power_w <= 0:
+                        continue
+                    end_total = round((sh * 60 + sm + dur_min) / 5) * 5
+                    eh, em = divmod(end_total % (24 * 60), 60)
+                    segments.append((sh, sm, eh, em, float(power_w), name))
+            return segments
+
+        self._cached_automation_segments = await self.hass.async_add_executor_job(_read)
+        if self._cached_automation_segments:
+            _LOGGER.info(
+                "Automation export segments: %s",
+                ", ".join(
+                    f"'{name}' {sh:02d}:{sm:02d}–{eh:02d}:{em:02d} @ {power_w/1000:.1f}kW"
+                    for sh, sm, eh, em, power_w, name in self._cached_automation_segments
+                ),
+            )
+
+    def _parse_automation_export_segments(
+        self,
+    ) -> list[tuple[int, int, int, int, float, str]]:
+        """Return cached automation export segments (populated by _refresh_automation_segments).
+
+        Returns an empty list if the feature is disabled or no qualifying automations exist.
+        The cache is refreshed once per optimization cycle via the async method above,
+        avoiding synchronous file I/O on the event loop thread.
+        """
+        if self._cached_automation_segments is None:
+            return []
+        return self._cached_automation_segments
+
+    def _get_automation_export_load(self, n_intervals: int) -> list[float] | None:
+        """Build a per-interval extra-load array from enabled daily force-discharge automations.
+
+        Reads the PowerSync automations store, finds all enabled time-triggered
+        force_discharge automations that run every day, and adds their planned
+        discharge as extra load so the LP charges enough to cover it.
+        """
+        segments = self._parse_automation_export_segments()
+        if not segments:
+            return None
+
+        interval_minutes = self._config.interval_minutes
+        _raw = dt_util.now()
+        now = _raw.replace(minute=(_raw.minute // interval_minutes) * interval_minutes, second=0, microsecond=0)
+        horizon_days = (self._config.horizon_hours // 24) + 1
+        extra_load = [0.0] * n_intervals
+
+        for sh, sm, eh, em, power_w, name in segments:
+            kwh = power_w * ((eh * 60 + em) - (sh * 60 + sm)) / 60 / 1000
+            _LOGGER.info(
+                "Automation export overlay: '%s' %02d:%02d–%02d:%02d @ %.1f kW = %.2f kWh/day",
+                name, sh, sm, eh, em, power_w / 1000, kwh,
+            )
+            for day_offset in range(horizon_days):
+                base = now + timedelta(days=day_offset)
+                day_start = base.replace(hour=sh, minute=sm, second=0, microsecond=0)
+                day_end = base.replace(hour=eh, minute=em, second=0, microsecond=0)
+                start_min = (day_start - now).total_seconds() / 60
+                end_min = (day_end - now).total_seconds() / 60
+                idx_start = max(0, int(start_min / interval_minutes))
+                idx_end = min(n_intervals, int(end_min / interval_minutes))
+                for i in range(idx_start, idx_end):
+                    extra_load[i] += power_w
+
+        if not any(v > 0 for v in extra_load):
+            return None
+
+        dt_h = interval_minutes / 60
+        total_kwh = sum(extra_load) / 1000 * dt_h
+        _LOGGER.debug(
+            "Automation export overlay: %.1f kW, %.1f kWh total across horizon",
+            power_w / 1000,
+            total_kwh,
+        )
+        return extra_load
+
+    def _get_automation_export_cap_w(self, n_intervals: int) -> list[float]:
+        """Return per-slot grid-export cap (W) for automation windows.
+
+        Non-automation slots get a very large cap (1 MW) which is effectively
+        unconstrained; in practice those slots have allow_battery_export=False so
+        the cap has no effect. Automation window slots are capped at the
+        automation's configured power so the LP plans discharge at 5 kW rather
+        than max_discharge_w (12.5 kW), preventing the phantom-discharge overestimate
+        that causes charging to 100% SoC when only ~76% is genuinely required.
+        """
+        cap = [1e6] * n_intervals
+        segments = self._parse_automation_export_segments()
+        if not segments:
+            return cap
+
+        interval_minutes = self._config.interval_minutes
+        _raw = dt_util.now()
+        now = _raw.replace(minute=(_raw.minute // interval_minutes) * interval_minutes, second=0, microsecond=0)
+        horizon_days = (self._config.horizon_hours // 24) + 1
+
+        for sh, sm, eh, em, power_w, _name in segments:
+            for day_offset in range(horizon_days):
+                base = now + timedelta(days=day_offset)
+                day_start = base.replace(hour=sh, minute=sm, second=0, microsecond=0)
+                day_end = base.replace(hour=eh, minute=em, second=0, microsecond=0)
+                start_min = (day_start - now).total_seconds() / 60
+                end_min = (day_end - now).total_seconds() / 60
+                idx_start = max(0, int(start_min / interval_minutes))
+                idx_end = min(n_intervals, int(end_min / interval_minutes))
+                for i in range(idx_start, idx_end):
+                    cap[i] = min(cap[i], power_w)
+
+        return cap
+
+    def _get_automation_export_allowed_slots(self, n_intervals: int) -> list[bool]:
+        """Return per-interval export permission for automation windows only.
+
+        When CONF_FACTOR_AUTOMATION_EXPORTS is enabled, the LP is allowed to
+        plan battery exports only in slots where a force-discharge automation
+        will run. This keeps the displayed schedule consistent with what the
+        automations will actually do, and prevents LP exports outside those
+        windows (e.g. in adjacent high-FiT slots after the automation ends).
+        """
+        allowed = [False] * n_intervals
+        segments = self._parse_automation_export_segments()
+        if not segments:
+            return allowed
+
+        interval_minutes = self._config.interval_minutes
+        _raw = dt_util.now()
+        now = _raw.replace(minute=(_raw.minute // interval_minutes) * interval_minutes, second=0, microsecond=0)
+        horizon_days = (self._config.horizon_hours // 24) + 1
+
+        for sh, sm, eh, em, _power_w, _name in segments:
+            for day_offset in range(horizon_days):
+                base = now + timedelta(days=day_offset)
+                day_start = base.replace(hour=sh, minute=sm, second=0, microsecond=0)
+                day_end = base.replace(hour=eh, minute=em, second=0, microsecond=0)
+                start_min = (day_start - now).total_seconds() / 60
+                end_min = (day_end - now).total_seconds() / 60
+                idx_start = max(0, int(start_min / interval_minutes))
+                idx_end = min(n_intervals, int(end_min / interval_minutes))
+                for i in range(idx_start, idx_end):
+                    allowed[i] = True
+
+        return allowed
+
+    def _apply_automation_export_power(
+        self,
+        schedule: OptimizationSchedule,
+        n_intervals: int,
+    ) -> OptimizationSchedule:
+        """Fill automation export windows with the automation-defined power level.
+
+        The LP discharges at max rate and may only plan export for part of the
+        automation window before switching to self_consumption. Since the automation
+        WILL run for the full configured duration regardless, this pass converts every
+        non-charge slot inside each automation window to export at the configured
+        wattage. Charge slots are left unchanged (the LP may want to charge mid-window
+        e.g. for solar buffering).
+
+        Uses timestamp-based window matching (not slot-index arithmetic) so the
+        result is correct regardless of how the LP snaps its horizon start time.
+        """
+        segments = self._parse_automation_export_segments()
+        if not segments:
+            return schedule
+
+        actions = list(schedule.actions or [])
+        if not actions:
+            return schedule
+
+        # Pre-compute each segment as (start_tod_minutes, end_tod_minutes, power_w)
+        windows: list[tuple[int, int, float]] = []
+        for sh, sm, eh, em, power_w, _name in segments:
+            windows.append((sh * 60 + sm, eh * 60 + em, power_w))
+
+        new_actions = list(actions)
+        pinned = 0
+        first_modified: int | None = None
+
+        for pos, action in enumerate(actions):
+            action_type = getattr(action, "action", None)
+            # Charge slots are respected — LP may need the battery during the window.
+            if action_type == "charge":
+                continue
+            ts = action.timestamp
+            slot_tod = ts.hour * 60 + ts.minute
+            target_w: float | None = None
+            for start_tod, end_tod, power_w in windows:
+                if start_tod <= slot_tod < end_tod:
+                    target_w = power_w
+                    break
+            if target_w is None:
+                continue
+            new_actions[pos] = ScheduleAction(
+                timestamp=ts,
+                action="export",
+                power_w=target_w,
+                soc=action.soc,  # updated below
+                battery_charge_w=0.0,
+                battery_discharge_w=target_w,
+            )
+            pinned += 1
+            if first_modified is None:
+                first_modified = pos
+
+        # Recalculate SoC forward from the first modified slot so the displayed
+        # SoC trajectory is consistent with the new battery_discharge_w values.
+        # Uses the same formula as the LP: soc += (charge*eff - discharge/eff)*dt/cap
+        if first_modified is not None and self._optimizer is not None:
+            cap_kwh = self._config.battery_capacity_wh / 1000.0
+            eff = getattr(self._optimizer, "efficiency", 0.92)
+            dt_h = self._config.interval_minutes / 60.0
+            backup = self._config.backup_reserve
+            soc = new_actions[first_modified].soc or 0.0
+            for pos in range(first_modified, len(new_actions)):
+                act = new_actions[pos]
+                charge_kw = (act.battery_charge_w or 0.0) / 1000.0
+                discharge_kw = (act.battery_discharge_w or 0.0) / 1000.0
+                new_soc = max(backup, min(1.0,
+                    soc + (charge_kw * eff - discharge_kw / eff) * dt_h / cap_kwh
+                ))
+                new_actions[pos] = ScheduleAction(
+                    timestamp=act.timestamp,
+                    action=act.action,
+                    power_w=act.power_w,
+                    soc=round(new_soc, 4),
+                    battery_charge_w=act.battery_charge_w,
+                    battery_discharge_w=act.battery_discharge_w,
+                )
+                soc = new_soc
+
+        _LOGGER.info(
+            "Automation power pin: %d/%d slots in automation windows set to export",
+            pinned, len(actions),
+        )
+
+        return OptimizationSchedule(
+            actions=new_actions,
+            predicted_cost=schedule.predicted_cost,
+            predicted_savings=schedule.predicted_savings,
+            last_updated=schedule.last_updated,
+        )
+
     async def _auto_detect_battery_specs(self) -> None:
         """Auto-detect battery capacity and power from Tesla site_info.
 
@@ -6055,10 +6405,19 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Add schedule data if available
         if self._current_schedule:
             api_response = self._current_schedule.to_api_response()
-            # Add grid import/export from LP result
+            # Add grid import/export from LP result, but use the post-processed
+            # schedule's battery_export_w for grid_export_w so the displayed
+            # values reflect pinned/spread post-processing rather than raw LP output.
             if self._last_optimizer_result:
                 api_response["grid_import_w"] = self._last_optimizer_result.grid_import_w
-                api_response["grid_export_w"] = self._last_optimizer_result.grid_export_w
+                # Prefer battery_export_w from the pinned/spread schedule so
+                # automation power-pinning is reflected in the chart.
+                pinned_export = self._current_schedule.battery_export_w
+                raw_export = self._last_optimizer_result.grid_export_w
+                if pinned_export and raw_export and len(pinned_export) == len(raw_export):
+                    api_response["grid_export_w"] = pinned_export
+                else:
+                    api_response["grid_export_w"] = raw_export
             # Add price arrays for pricing overlay (use actual tariff rates, not LP-adjusted)
             n_sched = len(api_response["timestamps"])
             display_import = self._last_display_import_prices or self._last_import_prices
