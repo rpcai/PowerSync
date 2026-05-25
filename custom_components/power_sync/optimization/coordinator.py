@@ -3699,11 +3699,14 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Slot index of the next Profit Max full-SOC target in the LP horizon.
 
         Used to enforce a pre-window SOC floor when profit_max mode is on.
-        Returns None when the floor should not be applied (profit_max off,
-        unsupported provider, or no upcoming target in horizon).
+        Returns None when the floor should not be applied (profit_max off
+        or no upcoming target in horizon).
 
-        Currently only Flow Power is supported. The default target is 17:15,
-        preserving the original 15-minute safety buffer before Happy Hour.
+        Provider-agnostic: any provider with a configured target time can use
+        profit_max to fill the battery before a known high-value export window
+        (e.g. Globird's PEAK at 16:00-21:00, Flow Power's Happy Hour at 17:30).
+        For Flow Power specifically, rejects targets >= 17:30 (inside HH) and
+        falls back to the default so the battery is full BEFORE HH starts.
         """
         if not self._entry:
             return None
@@ -3711,25 +3714,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
 
         from ..const import (
-            CONF_ELECTRICITY_PROVIDER,
-            CONF_FLOW_POWER_STATE,
             CONF_PROFIT_MAX_TARGET_TIME,
             DEFAULT_PROFIT_MAX_TARGET_TIME,
         )
-        provider = self._entry.options.get(
-            CONF_ELECTRICITY_PROVIDER,
-            self._entry.data.get(CONF_ELECTRICITY_PROVIDER, ""),
-        )
-        if provider != "flow_power":
-            return None
-        state = self._entry.options.get(
-            CONF_FLOW_POWER_STATE,
-            self._entry.data.get(CONF_FLOW_POWER_STATE, ""),
-        )
-        if not state:
-            return None
-
-        happy_start_min = 17 * 60 + 30  # 17:30
         target_min = _hhmm_to_minutes(
             self._entry.options.get(
                 CONF_PROFIT_MAX_TARGET_TIME,
@@ -3740,8 +3727,12 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             DEFAULT_PROFIT_MAX_TARGET_TIME,
         )
-        if target_min >= happy_start_min:
-            target_min = _hhmm_to_minutes(DEFAULT_PROFIT_MAX_TARGET_TIME)
+        # Flow Power Happy Hour starts at 17:30; reject targets inside HH so the
+        # battery is full BEFORE the window opens, not during it.
+        if self._provider_key() == "flow_power":
+            happy_start_min = 17 * 60 + 30
+            if target_min >= happy_start_min:
+                target_min = _hhmm_to_minutes(DEFAULT_PROFIT_MAX_TARGET_TIME)
         interval = self._config.interval_minutes
         n_steps = int(self._config.horizon_hours * 60) // interval
         raw_now = dt_util.now()

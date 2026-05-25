@@ -748,6 +748,44 @@ def test_flow_power_profit_max_rejects_target_after_happy_hour_start(opt_module)
     assert coordinator._next_profit_max_target_slot() == 105
 
 
+def test_profit_max_works_for_non_flow_power_provider(opt_module):
+    """Globird (and other TOU providers) must also fill before PEAK."""
+    coordinator = _coordinator(
+        opt_module,
+        "globird",
+        profit_max=True,
+        profit_max_target_time="15:45",
+    )
+
+    # 08:30 → 15:45 = 7h 15m = 87 5-min slots
+    assert coordinator._next_profit_max_target_slot() == 87
+
+
+def test_profit_max_disabled_returns_none_for_any_provider(opt_module):
+    coordinator = _coordinator(
+        opt_module,
+        "globird",
+        profit_max=False,
+        profit_max_target_time="15:45",
+    )
+
+    assert coordinator._next_profit_max_target_slot() is None
+
+
+def test_profit_max_non_flow_power_skips_happy_hour_guard(opt_module):
+    """Non-flow-power providers can set targets later than 17:30 if their
+    PEAK window allows it (the 17:30 fallback is HH-specific)."""
+    coordinator = _coordinator(
+        opt_module,
+        "octopus",
+        profit_max=True,
+        profit_max_target_time="18:00",
+    )
+
+    # 08:30 → 18:00 = 9h 30m = 114 5-min slots — NOT clamped back to 17:15 (105)
+    assert coordinator._next_profit_max_target_slot() == 114
+
+
 def test_flow_power_blocks_battery_charge_during_happy_hour(opt_module):
     coordinator = _coordinator(
         opt_module,
