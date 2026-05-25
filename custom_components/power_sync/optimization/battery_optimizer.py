@@ -134,6 +134,10 @@ class BatteryOptimizer:
         self.suppress_reserve_warning: bool = False
         self._below_reserve_recovery_target: float | None = None
 
+        # 0–1 fraction of capacity added on top of the demand-derived SoC ceiling
+        # during free import windows. Increase to add headroom for forecast errors.
+        self.free_window_soc_buffer: float = 0.0
+
         # Pre-window SOC floor: enforce soc[pre_window_slot - 1] >= target.
         # Used by the coordinator to guarantee the battery is filled before
         # high-value export windows (e.g. Flow Power Happy Hour) when
@@ -682,6 +686,64 @@ class BatteryOptimizer:
             allow_grid_charge,
             acquisition_cost_kwh,
         )
+
+        # === Free-window SoC ceiling ===
+        # Find runs of consecutive 0c-import periods. For each free window,
+        # cap the battery energy at the window boundaries to no more than
+        # backup_reserve + the net demand between this window and the next
+        # free window. This stops the LP charging greedily to 100% during a
+        # free import period when downstream demand is small — without it the
+        # near-zero import price plus terminal valuation pull the battery to
+        # full regardless of how little energy is genuinely needed.
+        _free_window_periods: list[tuple[int, int]] = []
+        _pi = 0
+        while _pi < p_n:
+            if 0.0 <= p_import[_pi] <= 0.001:
+                _pj = _pi
+                while _pj < p_n and 0.0 <= p_import[_pj] <= 0.001:
+                    _pj += 1
+                _free_window_periods.append((_pi, _pj - 1))
+                _pi = _pj
+            else:
+                _pi += 1
+
+        # Energy-variable ceiling, indexed by boundary t (0..p_n). energy_var(t)
+        # is the battery energy after period t-1; default 1.0 = no ceiling.
+        _energy_ceiling = [1.0] * (p_n + 1)
+        for _wi, (_wa, _wb) in enumerate(_free_window_periods):
+            _next = (
+                _free_window_periods[_wi + 1][0]
+                if _wi + 1 < len(_free_window_periods)
+                else p_n
+            )
+            _inter_demand_kwh = sum(
+                max(0.0, (p_load[_p] - p_solar[_p]) * p_dt[_p])
+                for _p in range(_wb + 1, _next)
+            )
+            _ceiling = min(
+                1.0,
+                self.backup_reserve
+                + _inter_demand_kwh / cap
+                + self.free_window_soc_buffer,
+            )
+            # Profit-max mode: if this free window sits before the pre-window
+            # SOC floor target (e.g. Flow Power Happy Hour fill-by time), lift
+            # the ceiling so the LP can fill to pre_window_soc_target here at 0c
+            # rather than paying grid-import rates between window and target.
+            if (
+                self.pre_window_slot is not None
+                and self.pre_window_soc_target > 0.0
+                and periods[_wb].end <= self.pre_window_slot
+            ):
+                _ceiling = max(_ceiling, self.pre_window_soc_target)
+            # When the plan starts inside this free window the LP has no prior
+            # periods in which to discharge — clamp at soc_0 so the ceiling
+            # cannot demand an impossible same-window SoC drop.
+            if _wa == 0:
+                _ceiling = max(soc_0, _ceiling)
+            for _p in range(_wa, _wb + 1):
+                _energy_ceiling[_p + 1] = _ceiling
+
         optimizer_reserve = self.backup_reserve
         self_consumption_floor = (
             max(0.0, min(soc_0, self.hardware_reserve))
@@ -1041,7 +1103,9 @@ class BatteryOptimizer:
 
         bounds.append((soc_0 * cap, soc_0 * cap))
         for t in range(1, p_n + 1):
-            bounds.append((reserve_floor[t] * cap, cap))
+            _lower = reserve_floor[t] * cap
+            _upper = min(cap, _energy_ceiling[t] * cap)
+            bounds.append((_lower, max(_lower, _upper)))
 
         A_eq = A_eq.tocsr()
         A_ub = A_ub.tocsr()
@@ -1472,19 +1536,9 @@ class BatteryOptimizer:
             import_kw = grid_import[t]
             export_kw = grid_export[t]
             charge_blocked = block_battery_charge[t]
-            free_import_slot = (
-                import_prices is not None
-                and import_prices[t] <= 0.001
-                and not charge_blocked
-            )
 
             # Determine action
-            if free_import_slot:
-                # Free electricity — always request force charge for the full
-                # slot so the action plan does not oscillate with the LP.
-                action = "charge"
-                power_w = max(charge_kw * 1000, self.max_charge_w)
-            elif charge_kw > threshold_kw and import_kw > (load[t] + threshold_kw):
+            if charge_kw > threshold_kw and import_kw > (load[t] + threshold_kw):
                 # Grid is providing more than load needs → grid charging battery
                 action = "charge"
                 power_w = charge_kw * 1000
@@ -1541,10 +1595,7 @@ class BatteryOptimizer:
 
             reported_charge_w = charge_kw * 1000
             reported_discharge_w = discharge_kw * 1000
-            if free_import_slot and action == "charge":
-                reported_charge_w = power_w
-                reported_discharge_w = 0.0
-            elif (
+            if (
                 action == "self_consumption"
                 and charge_kw < threshold_kw
                 and discharge_kw < threshold_kw
