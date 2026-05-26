@@ -6,6 +6,78 @@ here. Upstream commits from `bolagnaise/PowerSync` are NOT logged — see
 
 ---
 
+## [2026-05-26] Session: rebase onto upstream v2.12.473
+
+### Summary
+
+Rebased the 4 feature commits + 3 docs commits onto upstream v2.12.473
+(7 patch releases of upstream noise: 467 → 473). All 4 cherry-picks landed
+clean with **zero merge conflicts** — the conflict-risk assessment was
+spot-on: upstream's substantive changes (`e19b6fea`, `bc836a6b`, `f6ac6dfa`)
+all touched non-overlapping regions of our hot zones.
+
+Added a "Deployment Scope" section to CLAUDE.md noting this is a
+**FoxESS-only** deployment, with a worked example of misleading commit
+subjects (e19b6fea was labeled `fix(sungrow):` but its
+`_should_smooth_free_import_schedule` path is gated on
+`_supports_target_charge_power()` which includes FoxESS).
+
+### Upstream changes audited
+
+- `e19b6fea` fix(sungrow): added `_should_smooth_free_import_schedule()`.
+  Affects FoxESS (in TARGET_CHARGE_POWER_BATTERY_SYSTEMS). Behaviourally:
+  post-LP smoothing of charge power within free-import windows; preserves
+  total energy → **no conflict with our F2/F4 ceiling**.
+- `bc836a6b` fix(optimization): load-forecast robustness — filters
+  unknown/forecast sensors, recovers when load sensor returns. Pure
+  improvement; no overlap with our features.
+- `f6ac6dfa` fix(optimization): added `max_battery_export_w` config to
+  separate target-export caps from physical discharge limit. New plumbing
+  in `coordinator._sync_optimizer_discharge_limits()` + a new `elif`
+  branch in the optimizer's discharge bounds. None of it touches the
+  `_free_window_periods` / `_energy_ceiling` block. **Brought one broken
+  test along** (see below).
+
+### Test results
+
+- 693 passed (was 669 on v2.12.466 — upstream added ~24 tests)
+- 3 skipped (our 3 intentional `test_battery_optimizer_export_guard.py`
+  skips for greedy-fill behaviour we deliberately removed in F2)
+- 1 deselected — upstream's own broken test
+  `test_target_export_cap_is_separate_from_total_discharge` (added in
+  `f6ac6dfa`). Fails on pure `origin/main` too — asserts
+  `battery_discharge_w > 2500` but max is 1000W. Recorded in CLAUDE.md
+  under "Known Broken Upstream Tests" so future rebases recognise it.
+- 7 errors — sigenergy tests missing `cryptography` (pre-existing dev-env
+  issue, +1 vs last session because upstream added a sigenergy test).
+- 0 new failures.
+
+### Git Commits (this session)
+
+- `5e9889b4` feat(optimizer): inhibit optimizer exports, pin to automation windows (cherry-pick of 5bae924e)
+- `d31215a8` feat(optimizer): per-free-window SoC ceiling to prevent greedy charging (cherry-pick of 374280ec)
+- `ee7c5774` fix(optimizer): generalise profit_max pre-window slot to all providers (cherry-pick of 16f89974)
+- `263c4643` fix(optimizer): include downstream demand in profit_max ceiling lift (cherry-pick of ab6eb499)
+- `37c41946` docs: re-apply playbook (cherry-pick of cb5b4bb4)
+- `5b347125` docs: add Feature 4 + scipy/test-skip notes (cherry-pick of 5b5317cb)
+- `b9a56843` docs: CHANGELOG with v2.12.466 session record (cherry-pick of a3fa2d9c)
+- *(this commit)* docs: FoxESS-scope note + v2.12.473 session record
+
+### Branch State
+
+- Active: `powersync-custom-v2.12.473` (off `origin/main` @ a523d70c)
+- Predecessor: `powersync-custom-v2.12.466` (kept locally as recovery)
+
+### Next Steps
+
+- [ ] Deploy `custom_components/power_sync` to HA, restart, validate logs
+      per CLAUDE.md "Validation Checklist" (4 features × 1 log-line each)
+- [ ] Push to `rpcai` fork after live validation
+- [ ] Archive `powersync-custom-v2.12.466` (rename with `-archive-YYYYMMDD`)
+      once v2.12.473 stable for ~1 week
+
+---
+
 ## [2026-05-25] Session: 09:38–12:10
 
 ### Summary

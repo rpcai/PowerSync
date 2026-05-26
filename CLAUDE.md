@@ -6,11 +6,34 @@ the LP formulation periodically, so we expect to re-apply these features
 regularly. Treat this as the source of truth — keep it in sync with the
 actual commit history on the active branch.
 
+## Deployment Scope
+
+**Our deployment is FoxESS-only.** Upstream supports 10+ battery systems
+(Tesla, Sungrow, GoodWe, Sigenergy, AlphaESS, Solax, ESY Sunhome, SAJ,
+Neovolt, Bytewatt, etc.) but we only run on FoxESS hardware. When auditing
+upstream changes:
+
+- **Commit subjects can mislead.** A commit prefixed `fix(sungrow):` may
+  still affect us if the code path is gated on a list that includes FoxESS.
+  Example: `e19b6fea` ("fix(sungrow): stabilize tariff and free-period
+  charging") added `_should_smooth_free_import_schedule()` gated on
+  `_supports_target_charge_power()` → membership in
+  `TARGET_CHARGE_POWER_BATTERY_SYSTEMS`, which includes `BATTERY_SYSTEM_FOXESS`.
+  Always read the gate, not just the prefix.
+- **Systems we can ignore in upstream noise:** Tesla Powerwall, Sigenergy,
+  Sungrow, GoodWe, AlphaESS, Solax, ESY Sunhome, SAJ, Neovolt, Bytewatt,
+  Fronius, Huawei, Enphase, Zeversolar — provided the change is in a
+  vendor-specific file path (`*/sigenergy_*`, `*/sungrow_*`, etc.) AND
+  is not referenced from `optimization/`.
+- **Systems that affect us regardless of subject:** Any change touching
+  `TARGET_CHARGE_POWER_BATTERY_SYSTEMS` membership or the optimizer's
+  cross-system bound logic. FoxESS sits in those shared lists.
+
 ## Branch Strategy
 
 We keep one active branch that tracks `origin/main` with our customisations
 cherry-picked on top. The branch is named for the upstream version it sits
-on, e.g. `powersync-custom-v2.12.466`. When upstream advances:
+on, e.g. `powersync-custom-v2.12.473`. When upstream advances:
 
 1. Create a NEW branch from the new `origin/main` (do NOT reuse the old one).
 2. Cherry-pick our feature commits onto it.
@@ -256,6 +279,19 @@ Feature 2:
 still apply — the underlying contract conflict has not changed. Re-add the
 `@pytest.mark.skip(...)` decorator if a merge drops it.
 
+## Known Broken Upstream Tests
+
+These tests are broken on `origin/main` itself — not caused by our patches.
+Confirm by checking out the file from `origin/main` alone and re-running.
+
+| Test | Origin | Reason |
+|------|--------|--------|
+| `tests/test_battery_optimizer_export_guard.py::test_target_export_cap_is_separate_from_total_discharge` | Added in upstream `f6ac6dfa` (v2.12.473) | Asserts `battery_discharge_w > 2500` but actual max is 1000W; appears to be a test-only bug. Survives `git checkout origin/main -- tests/test_battery_optimizer_export_guard.py custom_components/power_sync/optimization/battery_optimizer.py`. |
+
+Run the suite with `--deselect <test>` to exclude broken upstream tests, or
+just visually exclude them when reviewing the summary. **Do not patch the
+test or production code** — let upstream own the fix; revisit on each rebase.
+
 ## Failure Modes (lessons from past rounds)
 
 - **LP refactor: `t`-indexed → period-indexed.** Upstream rewrote the LP to
@@ -383,7 +419,7 @@ the 4 LP-behaviour tests in `tests/test_battery_optimizer_free_window.py`
 plus most tests in `tests/test_battery_optimizer_export_guard.py`. **Keep
 scipy installed** so we catch LP regressions before deploy.
 
-The full suite (~670 tests on v2.12.466) runs in <30s:
+The full suite (~700 tests on v2.12.473) runs in <30s:
 
 ```bash
 python3 -m pytest tests/ -q
@@ -407,7 +443,7 @@ No CI pipeline. Manual copy + restart. Logs at
 ## Recovery
 
 If a rebase produces a broken result:
-- The previous version branch (e.g. `powersync-custom-v2.12.459`) still
+- The previous version branch (e.g. `powersync-custom-v2.12.466`) still
   exists locally. Check it out and redeploy from there.
 - The 3 feature commits are stable git objects — even if their containing
   branch is deleted, `git reflog` will surface them for a while.
