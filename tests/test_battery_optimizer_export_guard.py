@@ -459,10 +459,15 @@ def test_below_reserve_can_grid_charge_during_cheap_window(battery_optimizer_mod
     assert max(action.battery_charge_w for action in cheap_window) > 1000
 
 
-def test_below_optimizer_reserve_lp_uses_hardware_floor(
+def test_below_optimizer_reserve_lp_intermediate_floor_is_hardware_reserve(
     battery_optimizer_module,
     monkeypatch,
 ):
+    """When SOC is below the optimiser reserve the LP keeps the intermediate
+    SOC floor at the hardware reserve (so self-consumption can still draw
+    down) while pinning the end-of-horizon floor at the optimiser reserve
+    so the plan recovers to the configured reserve at the cheapest
+    opportunity within the horizon."""
     captured = {}
 
     def fake_linprog(c, **kwargs):
@@ -503,12 +508,25 @@ def test_below_optimizer_reserve_lp_uses_hardware_floor(
         allow_battery_export=[True] * 12,
     )
 
-    assert captured["bounds"][-1][0] == pytest.approx(0.5)
+    # Energy bounds (one per boundary, p_n+1 = 13 entries) are appended at
+    # the end of the bounds list, after grid/charge/discharge power bounds.
+    energy_bounds = captured["bounds"][-13:]
+    # Boundary 0 is the starting energy (soc_0 * cap = 0.15 * 10 = 1.5).
+    assert energy_bounds[0][0] == pytest.approx(1.5)
+    # Intermediate boundaries use the hardware-reserve floor (0.05 * 10 = 0.5).
+    for lower, _upper in energy_bounds[1:-1]:
+        assert lower == pytest.approx(0.5)
+    # End-of-horizon boundary is pinned at the optimiser reserve
+    # (0.50 * 10 = 5.0) to drive recovery within the horizon.
+    assert energy_bounds[-1][0] == pytest.approx(5.0)
 
 
 def test_below_optimizer_reserve_allows_natural_self_consumption(
     battery_optimizer_module,
 ):
+    """When SOC is below reserve, the LP must still allow battery discharge
+    to serve load (not idle the battery), even though it must also plan to
+    charge back to the optimiser reserve by end of horizon."""
     optimizer = battery_optimizer_module.BatteryOptimizer(
         capacity_wh=13500,
         max_charge_w=5000,
@@ -529,15 +547,142 @@ def test_below_optimizer_reserve_allows_natural_self_consumption(
         allow_battery_export=[False] * 12,
     )
 
-    assert result.schedule.actions[0].action == "self_consumption"
-    assert result.schedule.actions[0].battery_discharge_w > 0
-    assert result.schedule.actions[0].battery_charge_w == 0
+    # Battery is used to serve load somewhere in the horizon — the LP may
+    # interleave charge slots with self_consumption slots to satisfy both the
+    # load and the EOH recovery floor, so don't pin the assertion to slot 0.
+    assert any(
+        action.action == "self_consumption" and action.battery_discharge_w > 0
+        for action in result.schedule.actions
+    )
 
 
-def test_below_optimizer_reserve_blocks_lp_battery_export(
+def test_below_optimizer_reserve_recovers_via_cheap_window(battery_optimizer_module):
+    """Regression: when SOC starts below the optimiser reserve and a cheap
+    import window exists in the horizon, the LP must plan to charge from
+    the cheap window such that end-of-horizon SOC is at least the optimiser
+    reserve, *and* the recovery import must come from the cheap window
+    (the LP should not force grid charging at whatever the current price
+    happens to be). Previously the floor was silently relaxed to the
+    hardware reserve with no recovery mechanism, so the LP would just
+    drift along the hardware floor."""
+    optimizer = battery_optimizer_module.BatteryOptimizer(
+        capacity_wh=47800,        # 47.8 kWh battery
+        max_charge_w=14900,       # 14.9 kW charge
+        max_discharge_w=12500,
+        backup_reserve=0.35,      # user-configured optimiser reserve
+        hardware_reserve=0.10,
+        interval_minutes=5,
+        horizon_hours=6,
+    )
+
+    # 6h horizon = 72 intervals.
+    #   slots 0..23  (2 h) expensive shoulder at 0.34 $/kWh
+    #   slots 24..59 (3 h) cheap OFF_PEAK at 0.05 $/kWh
+    #   slots 60..71 (1 h) shoulder at 0.34 $/kWh
+    n = 72
+    import_prices = [0.34] * 24 + [0.05] * 36 + [0.34] * 12
+    export_prices = [0.06] * n
+    load = [0.5] * n
+    solar = [0.0] * n
+
+    result = optimizer.optimize(
+        import_prices=import_prices,
+        export_prices=export_prices,
+        solar_forecast=solar,
+        load_forecast=load,
+        current_soc=0.22,         # starts BELOW the 0.35 reserve
+        acquisition_cost_kwh=0.0,
+        allow_battery_export=[False] * n,
+    )
+
+    assert result.feasible is True
+    # Recovery must reach the optimiser reserve at some point in or after the
+    # cheap window. The schedule reporter applies natural self-consumption
+    # discharge after the LP-planned charge, so peak post-cheap-window SOC
+    # is the appropriate measure rather than strict EOH SOC.
+    peak_post_charge_soc = max(action.soc for action in result.schedule.actions[24:])
+    assert peak_post_charge_soc >= 0.35 - 1e-3, (
+        "Schedule must recover to >= optimiser reserve (0.35); peak "
+        f"post-cheap-window SOC was {peak_post_charge_soc:.3f}"
+    )
+
+    # Recovery import must come from the cheap window, not be force-charged
+    # at the expensive surrounding shoulder price.
+    dt_h = 5 / 60
+    cheap_import_kwh = sum(result.grid_import_w[24:60]) * dt_h / 1000
+    expensive_import_kwh = (
+        sum(result.grid_import_w[:24] + result.grid_import_w[60:]) * dt_h / 1000
+    )
+    assert cheap_import_kwh > expensive_import_kwh, (
+        f"Recovery should prefer cheap window; got cheap={cheap_import_kwh:.2f} "
+        f"kWh, expensive={expensive_import_kwh:.2f} kWh"
+    )
+
+
+def test_below_optimizer_reserve_plans_post_recovery_export(battery_optimizer_module):
+    """Regression: when SOC starts below the optimiser reserve, the LP must
+    still plan profitable exports in late-horizon slots after the SOC could
+    have recovered above the reserve. Previously a blanket export block for
+    the entire horizon meant a bonus-export window opening hours after a
+    cheap-window charge was silently dropped from the plan."""
+    optimizer = battery_optimizer_module.BatteryOptimizer(
+        capacity_wh=47800,
+        max_charge_w=14900,
+        max_discharge_w=12500,
+        backup_reserve=0.35,
+        hardware_reserve=0.10,
+        interval_minutes=5,
+        horizon_hours=6,
+    )
+
+    # 6h horizon = 72 intervals.
+    #   slots 0..23  (2 h) shoulder import at 0.34 $/kWh, export 0.00 $/kWh
+    #   slots 24..59 (3 h) cheap OFF_PEAK at 0.05 $/kWh, export 0.00 $/kWh
+    #   slots 60..71 (1 h) PEAK import at 0.48 $/kWh, export 0.50 $/kWh
+    n = 72
+    import_prices = [0.34] * 24 + [0.05] * 36 + [0.48] * 12
+    export_prices = [0.0] * 60 + [0.50] * 12
+    load = [0.5] * n
+    solar = [0.0] * n
+
+    result = optimizer.optimize(
+        import_prices=import_prices,
+        export_prices=export_prices,
+        solar_forecast=solar,
+        load_forecast=load,
+        current_soc=0.22,         # starts BELOW the 0.35 reserve
+        acquisition_cost_kwh=0.0,
+        allow_battery_export=[True] * n,
+    )
+
+    assert result.feasible is True
+
+    dt_h = 5 / 60
+    # No export in the early shoulder window — SOC could not yet have reached
+    # the optimiser reserve via max-rate charge, so the LP must not deepen
+    # the deficit. (Also: shoulder export price is 0, so even without the
+    # gating the LP wouldn't export here. The mask makes it impossible.)
+    early_export_kwh = sum(result.grid_export_w[:24]) * dt_h / 1000
+    assert early_export_kwh == pytest.approx(0.0, abs=1e-3)
+
+    # Profitable late-window export must appear in the plan.
+    late_export_kwh = sum(result.grid_export_w[60:]) * dt_h / 1000
+    assert late_export_kwh > 1.0, (
+        f"LP must plan post-recovery export at the profitable late window; "
+        f"got {late_export_kwh:.2f} kWh"
+    )
+
+
+def test_below_optimizer_reserve_lp_blocks_export_until_recovery_reachable(
     battery_optimizer_module,
     monkeypatch,
 ):
+    """When SOC is below the optimiser reserve, the LP blocks battery export
+    for slots where the max-rate-charge ratchet from soc_0 shows SOC could
+    not yet have recovered to the optimiser reserve. Later slots keep their
+    caller-supplied export permission so the LP can still plan post-recovery
+    exports (e.g. a bonus-export window opening hours after a cheap-window
+    charge completes)."""
     captured = {}
 
     def fake_linprog(c, **kwargs):
@@ -588,10 +733,13 @@ def test_below_optimizer_reserve_blocks_lp_battery_export(
     period_count = (captured["variable_count"] - 1) // 5
     grid_export_bounds = captured["bounds"][period_count:period_count * 2]
     assert grid_export_bounds
-    assert all(bound[1] == 0.0 for bound in grid_export_bounds)
-    assert result.schedule.actions[0].action == "self_consumption"
-    assert max(result.grid_export_w) <= 1e-6
-    assert all(action.action != "export" for action in result.schedule.actions)
+    # Slot 0: max-reachable SOC at the start of period 0 is exactly soc_0
+    # (= 0.149), below the optimiser reserve (0.15), so export is blocked.
+    assert grid_export_bounds[0][1] == pytest.approx(0.0)
+    # Slots 1+: max-reachable rises by ~5 kW * 0.95 * 5/60 / 13.5 = 0.029
+    # SOC per slot, so SOC could be >= 0.15 from slot 1 onwards. Export is
+    # allowed (upper bound is the grid export capacity, not zero).
+    assert all(bound[1] > 0.0 for bound in grid_export_bounds[1:])
 
 
 def test_below_optimizer_reserve_blocks_greedy_battery_export(

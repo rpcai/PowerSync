@@ -778,7 +778,35 @@ class BatteryOptimizer:
             # optimiser reserve. Real import/export prices can still justify
             # charging, but ordinary self-use should be allowed to continue.
             self.terminal_weight = 0.0
-            allow_battery_export = [False] * n
+            # Block battery export only for slots where SOC could not yet be
+            # at the optimiser reserve under max-rate charge from the current
+            # SOC. Late-horizon slots (after the earliest possible recovery
+            # point) keep their caller-supplied export permission so the LP
+            # can plan profitable post-recovery exports — e.g. a bonus-export
+            # window that opens hours after a cheap-window charge would
+            # complete.
+            cap = self.capacity_kwh
+            if cap > 0 and self.max_charge_kw > 0:
+                max_reachable = soc_0
+                soc_per_slot = (
+                    self.max_charge_kw * self.efficiency * self.dt_hours / cap
+                )
+                gated_allow_export: list[bool] = []
+                for t in range(n):
+                    if max_reachable < self.backup_reserve:
+                        gated_allow_export.append(False)
+                    else:
+                        gated_allow_export.append(allow_battery_export[t])
+                    max_reachable = min(1.0, max_reachable + soc_per_slot)
+                allow_battery_export = gated_allow_export
+            else:
+                allow_battery_export = [False] * n
+            # Engage the recovery target so the LP plans to charge back above
+            # the optimiser reserve at the cheapest available time within the
+            # horizon. Without this the LP would drift indefinitely below the
+            # user-configured reserve, barely exceeding the hardware floor.
+            if self._below_reserve_recovery_target is None:
+                self._below_reserve_recovery_target = self.backup_reserve
 
         try:
             return self._solve_lp_inner(
@@ -855,21 +883,32 @@ class BatteryOptimizer:
         reserve_floor = [self_consumption_floor] * (p_n + 1)
         recovery_target = self._below_reserve_recovery_target
         if recovery_target is not None and recovery_target > self_consumption_floor:
-            max_reachable = soc_0
-            reserve_floor[0] = soc_0
-            for t in range(p_n):
-                reachable_charge_kw = (
-                    0.0
-                    if p_block_charge[t]
-                    else self._charge_limit_kw(
-                        p_load[t], p_solar[t], allow_grid_charge
-                    )
+            # End-of-horizon recovery floor. The LP picks the cheapest charge
+            # slot(s) within the horizon to reach the target, rather than
+            # ratcheting up at maximum charge rate from the current slot
+            # (which would force grid charging at whatever the current import
+            # price happens to be). Cap at what is physically reachable from
+            # soc_0 to keep the LP feasible.
+            max_charge_kwh = self.max_charge_kw * eff * sum(p_dt)
+            max_reachable_soc = (
+                min(1.0, soc_0 + max_charge_kwh / cap)
+                if cap > 0
+                else soc_0
+            )
+            effective_recovery_target = min(
+                recovery_target,
+                max(self_consumption_floor, max_reachable_soc - 0.005),
+            )
+            if effective_recovery_target > self_consumption_floor:
+                reserve_floor[p_n] = effective_recovery_target
+                _LOGGER.debug(
+                    "Below-reserve recovery floor: target=%.1f%% at end of "
+                    "horizon (%d periods, %.1f h), current SOC %.1f%%",
+                    effective_recovery_target * 100,
+                    p_n,
+                    sum(p_dt),
+                    soc_0 * 100,
                 )
-                max_reachable = min(
-                    recovery_target,
-                    max_reachable + reachable_charge_kw * eff * p_dt[t] / cap,
-                )
-                reserve_floor[t + 1] = max(self_consumption_floor, max_reachable)
 
         # Boundary-energy state model: power variables per period, battery energy
         # variables at period boundaries. This removes the dense cumulative SOC
