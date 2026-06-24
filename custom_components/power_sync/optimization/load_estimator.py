@@ -51,6 +51,36 @@ RECENT_LOAD_BLEND = 0.7
 RECENT_LOAD_MIN_SCALE = 0.8
 RECENT_LOAD_MAX_SCALE = 2.5
 
+# Temperature sensitivity (fractional load change per °C of deviation from the
+# slot-average temperature). The clamp is deliberately asymmetric: cooling load
+# (positive α, AC ramping in heat) and heating load (negative α, load rising as
+# it gets colder) have different plausible magnitudes. The negative bound is
+# wide enough to admit the strong overnight heating sensitivity measured on this
+# site (≈ −0.09/°C) without truncating it — the old −0.02 floor throttled a real
+# −0.05…−0.09 fit down to a near-inert correction.
+TEMP_ALPHA_MIN = -0.12
+TEMP_ALPHA_MAX = 0.15
+TEMP_ALPHA_WEAK = 0.005  # |α| below this ⇒ segment treated as temperature-insensitive
+TEMP_FIT_MIN_PAIRS = 50
+TEMP_FIT_MIN_SUMXX = 0.1
+
+# Time-of-day segments for temperature sensitivity. Heating demand (evening,
+# overnight, and the morning warm-up ramp) responds far more strongly to cold
+# than the midday period, so α is fitted independently per segment rather than
+# as one global coefficient that dilutes the overnight signal.
+TEMP_SEG_OVERNIGHT = "overnight"
+TEMP_SEG_DAY = "day"
+
+
+def _temp_segment(local_hour: int) -> str:
+    """Return the temperature-sensitivity segment for a local-time hour.
+
+    overnight = 17:00–10:00 (evening + overnight + morning heating ramp)
+    day       = 10:00–17:00
+    """
+    return TEMP_SEG_OVERNIGHT if (local_hour >= 17 or local_hour < 10) else TEMP_SEG_DAY
+
+
 _SOLCAST_ESTIMATE_FIELDS = {
     SOLCAST_ESTIMATE: ("pv_estimate", "pv_estimate50"),
     SOLCAST_ESTIMATE10: ("pv_estimate10", "pv_estimate", "pv_estimate50"),
@@ -100,8 +130,10 @@ class LoadEstimator:
         self._cache_time: datetime | None = None
         self._cache_duration = timedelta(hours=1)
 
-        # Temperature sensitivity cache
-        self._temp_alpha: float | None = None
+        # Temperature sensitivity cache. _temp_alpha maps each time-of-day
+        # segment (see _temp_segment) to its fitted α; None until a fit with at
+        # least one usable segment has run.
+        self._temp_alpha: dict[str, float] | None = None
         self._temp_bucket_averages: dict[tuple[int, int, int], float] | None = None
         self._temp_alpha_fitted: bool = False  # True once fitting has run (even if α=None)
         self._temp_cache_time: datetime | None = None
@@ -148,7 +180,7 @@ class LoadEstimator:
                 # Fetch temperature data and fit sensitivity if weather entity configured
                 forecast_temps: list[tuple[datetime, float]] | None = None
                 bucket_temp_avgs: dict | None = None
-                alpha: float | None = None
+                alpha: dict[str, float] | None = None
                 if self.weather_entity_id:
                     forecast_temps, bucket_temp_avgs, alpha = await self._get_temperature_adjustment(
                         history, horizon_hours
@@ -310,13 +342,14 @@ class LoadEstimator:
         n_intervals: int,
         forecast_temps: list[tuple[datetime, float]] | None = None,
         bucket_temp_averages: dict | None = None,
-        alpha: float | None = None,
+        alpha: dict[str, float] | None = None,
     ) -> list[float]:
         """Generate forecast using historical pattern matching with optional temperature scaling.
 
         forecast_temps: hourly (datetime, temp_c) pairs for the forecast horizon
         bucket_temp_averages: (dow, hour, half_hour) -> historical avg temp_c
-        alpha: sensitivity coefficient — load changes alpha*100% per °C deviation
+        alpha: per-segment sensitivity (see _temp_segment) — within a segment,
+            load changes alpha*100% per °C deviation from the slot-average temp
         """
         # Group by (day_of_week, hour, half_hour)
         pattern: dict[tuple[int, int, int], list[tuple[datetime, float]]] = defaultdict(list)
@@ -361,14 +394,16 @@ class LoadEstimator:
                 current_time,
             )
 
-            # Temperature scaling
+            # Temperature scaling — α is segment-specific (overnight heating
+            # responds far more strongly to cold than midday).
             if temp_map and bucket_temp_averages is not None and alpha is not None:
+                seg_alpha = alpha.get(_temp_segment(hour))
                 slot_hour = local_cur.replace(minute=0, second=0, microsecond=0)
                 t_cast = temp_map.get(slot_hour)
                 mu_temp = bucket_temp_averages.get(key)
-                if t_cast is not None and mu_temp is not None:
+                if seg_alpha is not None and t_cast is not None and mu_temp is not None:
                     delta_t = t_cast - mu_temp
-                    scale = max(0.5, min(2.5, 1.0 + alpha * delta_t))
+                    scale = max(0.5, min(2.5, 1.0 + seg_alpha * delta_t))
                     base = base * scale
 
             forecast.append(base)
@@ -604,11 +639,12 @@ class LoadEstimator:
         self,
         history: list[tuple[datetime, float]],
         horizon_hours: int,
-    ) -> tuple[list[tuple[datetime, float]] | None, dict | None, float | None]:
+    ) -> tuple[list[tuple[datetime, float]] | None, dict | None, dict[str, float] | None]:
         """Fetch temperature data and return (forecast_temps, bucket_temp_avgs, alpha).
 
-        Uses a 1-hour cache for the fitted alpha.  Returns (None, None, None) if
-        temperature data is unavailable or the fit is too weak to be useful.
+        alpha is a per-segment mapping (see _temp_segment). Uses a 1-hour cache
+        for the fitted alpha.  Returns (None, None, None) if temperature data is
+        unavailable or no segment has a usable fit.
         """
         now = dt_util.utcnow()
 
@@ -820,7 +856,7 @@ class LoadEstimator:
         self,
         history: list[tuple[datetime, float]],
         temp_history: list[tuple[datetime, float]],
-    ) -> tuple[dict[tuple[int, int, int], float] | None, float | None]:
+    ) -> tuple[dict[tuple[int, int, int], float] | None, dict[str, float] | None]:
         """Bucket the load history and fit temperature sensitivity (executor-only).
 
         Iterates the full load history (tens of thousands of points) and runs a
@@ -847,15 +883,19 @@ class LoadEstimator:
         temp_history: list[tuple[datetime, float]],
         bucket_averages: dict[tuple[int, int, int], float],
         bucket_temp_averages: dict[tuple[int, int, int], float],
-    ) -> float | None:
-        """Fit a global linear sensitivity coefficient α.
+    ) -> dict[str, float] | None:
+        """Fit a per-segment linear sensitivity coefficient α.
 
         α is the fraction of bucket-average load that changes per °C of temperature
         deviation from the bucket-average temperature:
             load_adj = bucket_avg × (1 + α × ΔT)
 
-        Uses closed-form regression through the origin on (ΔT, fractional_load_deviation).
-        Returns None if data is insufficient or the fit is too weak.
+        A separate α is fitted for each time-of-day segment (see _temp_segment),
+        because overnight heating responds far more strongly to cold than the
+        midday period — a single global α dilutes the overnight signal. Each
+        segment uses closed-form regression through the origin on
+        (ΔT, fractional_load_deviation). Returns a {segment: α} mapping for the
+        segments with a usable fit, or None if no segment qualifies.
         """
         if not temp_history:
             return None
@@ -864,9 +904,11 @@ class LoadEstimator:
         sorted_temps = sorted(temp_history, key=lambda x: x[0])
         sorted_timestamps = [t for t, _ in sorted_temps]
 
-        sum_xy = 0.0
-        sum_xx = 0.0
-        n_pairs = 0
+        # Accumulate regression sums independently per segment.
+        sums: dict[str, list[float]] = {
+            TEMP_SEG_OVERNIGHT: [0.0, 0.0, 0],  # [sum_xy, sum_xx, n_pairs]
+            TEMP_SEG_DAY: [0.0, 0.0, 0],
+        }
 
         for ts, load_w in history:
             local_ts = dt_util.as_local(ts) if ts.tzinfo else ts
@@ -894,30 +936,40 @@ class LoadEstimator:
             y = (load_w - mu_load) / mu_load  # Fractional load deviation
             x = temp_c - mu_temp              # °C deviation from slot avg
 
-            sum_xy += x * y
-            sum_xx += x * x
-            n_pairs += 1
+            acc = sums[_temp_segment(local_ts.hour)]
+            acc[0] += x * y
+            acc[1] += x * x
+            acc[2] += 1
 
-        if n_pairs < 50 or sum_xx < 0.1:
-            _LOGGER.debug(
-                "Temperature sensitivity: insufficient data (%d pairs, sum_xx=%.3f), skipping",
-                n_pairs, sum_xx,
+        alphas: dict[str, float] = {}
+        for segment, (sum_xy, sum_xx, n_pairs) in sums.items():
+            if n_pairs < TEMP_FIT_MIN_PAIRS or sum_xx < TEMP_FIT_MIN_SUMXX:
+                _LOGGER.debug(
+                    "Temperature sensitivity [%s]: insufficient data "
+                    "(%d pairs, sum_xx=%.3f), skipping",
+                    segment, n_pairs, sum_xx,
+                )
+                continue
+
+            alpha = sum_xy / sum_xx
+            # Asymmetric clamp: heating-dominated homes show strong negative α
+            # (load rises as it gets colder); cooling shows positive α.
+            alpha = max(TEMP_ALPHA_MIN, min(TEMP_ALPHA_MAX, alpha))
+
+            if abs(alpha) < TEMP_ALPHA_WEAK:
+                _LOGGER.debug(
+                    "Temperature sensitivity [%s] too weak (α=%.4f), skipping",
+                    segment, alpha,
+                )
+                continue
+
+            alphas[segment] = alpha
+            _LOGGER.info(
+                "Temperature sensitivity fitted [%s]: α=%.4f/°C from %d data pairs",
+                segment, alpha, n_pairs,
             )
-            return None
 
-        alpha = sum_xy / sum_xx
-        # Clamp: load rarely drops below 50% in cold; AC can scale 2.5× in heat
-        alpha = max(-0.02, min(0.15, alpha))
-
-        if abs(alpha) < 0.005:
-            _LOGGER.debug("Temperature sensitivity too weak (α=%.4f), skipping", alpha)
-            return None
-
-        _LOGGER.info(
-            "Temperature sensitivity fitted: α=%.4f/°C from %d data pairs",
-            alpha, n_pairs,
-        )
-        return alpha
+        return alphas or None
 
     def invalidate_cache(self) -> None:
         """Invalidate history and temperature caches (e.g. when away_mode changes)."""
