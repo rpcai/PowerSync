@@ -134,6 +134,7 @@ class LoadEstimator:
         # segment (see _temp_segment) to its fitted α; None until a fit with at
         # least one usable segment has run.
         self._temp_alpha: dict[str, float] | None = None
+        self._temp_regime_offset: dict[str, float] | None = None
         self._temp_bucket_averages: dict[tuple[int, int, int], float] | None = None
         self._temp_alpha_fitted: bool = False  # True once fitting has run (even if α=None)
         self._temp_cache_time: datetime | None = None
@@ -181,10 +182,14 @@ class LoadEstimator:
                 forecast_temps: list[tuple[datetime, float]] | None = None
                 bucket_temp_avgs: dict | None = None
                 alpha: dict[str, float] | None = None
+                regime_temp_offset: dict[str, float] | None = None
                 if self.weather_entity_id:
-                    forecast_temps, bucket_temp_avgs, alpha = await self._get_temperature_adjustment(
-                        history, horizon_hours
-                    )
+                    (
+                        forecast_temps,
+                        bucket_temp_avgs,
+                        alpha,
+                        regime_temp_offset,
+                    ) = await self._get_temperature_adjustment(history, horizon_hours)
                 # Building the forecast iterates the full load history (tens to
                 # hundreds of thousands of recorder points) and re-scans it for
                 # the recent-regime adjustment — heavy, pure-CPU work. Run it off
@@ -198,6 +203,7 @@ class LoadEstimator:
                         forecast_temps=forecast_temps,
                         bucket_temp_averages=bucket_temp_avgs,
                         alpha=alpha,
+                        regime_temp_offset=regime_temp_offset,
                     )
                 )
                 avg_w = sum(forecast) / len(forecast) if forecast else 0
@@ -343,6 +349,7 @@ class LoadEstimator:
         forecast_temps: list[tuple[datetime, float]] | None = None,
         bucket_temp_averages: dict | None = None,
         alpha: dict[str, float] | None = None,
+        regime_temp_offset: dict[str, float] | None = None,
     ) -> list[float]:
         """Generate forecast using historical pattern matching with optional temperature scaling.
 
@@ -350,6 +357,11 @@ class LoadEstimator:
         bucket_temp_averages: (dow, hour, half_hour) -> historical avg temp_c
         alpha: per-segment sensitivity (see _temp_segment) — within a segment,
             load changes alpha*100% per °C deviation from the slot-average temp
+        regime_temp_offset: per-segment mean of (recent_temp − slot_avg_temp) over
+            the recent window. The bulk cold/warm level shift it represents is
+            already carried by _recent_load_scales; subtracting it leaves α acting
+            only on the within-regime temperature wiggle, so the two corrections
+            don't double-count the same heating.
         """
         # Group by (day_of_week, hour, half_hour)
         pattern: dict[tuple[int, int, int], list[tuple[datetime, float]]] = defaultdict(list)
@@ -395,14 +407,19 @@ class LoadEstimator:
             )
 
             # Temperature scaling — α is segment-specific (overnight heating
-            # responds far more strongly to cold than midday).
+            # responds far more strongly to cold than midday). The regime offset
+            # removes the part of the deviation already absorbed by the recent
+            # load scale, so α only models the within-regime wiggle.
             if temp_map and bucket_temp_averages is not None and alpha is not None:
-                seg_alpha = alpha.get(_temp_segment(hour))
+                seg = _temp_segment(hour)
+                seg_alpha = alpha.get(seg)
                 slot_hour = local_cur.replace(minute=0, second=0, microsecond=0)
                 t_cast = temp_map.get(slot_hour)
                 mu_temp = bucket_temp_averages.get(key)
                 if seg_alpha is not None and t_cast is not None and mu_temp is not None:
                     delta_t = t_cast - mu_temp
+                    if regime_temp_offset is not None:
+                        delta_t -= regime_temp_offset.get(seg, 0.0)
                     scale = max(0.5, min(2.5, 1.0 + seg_alpha * delta_t))
                     base = base * scale
 
@@ -412,25 +429,40 @@ class LoadEstimator:
         # Apply smoothing
         forecast = self._smooth_forecast(forecast)
 
-        recent_scale = self._recent_load_scale(history, start_time)
-        if recent_scale is not None:
-            forecast = [value * recent_scale for value in forecast]
+        # Recent-regime level shift, applied per segment so an overnight heating
+        # ramp lifts the overnight slots without being diluted by a flatter day.
+        recent_scales = self._recent_load_scales(history, start_time)
+        if recent_scales:
+            scaled: list[float] = []
+            slot_time = start_time
+            for value in forecast:
+                local_slot = dt_util.as_local(slot_time) if slot_time.tzinfo else slot_time
+                scaled.append(value * recent_scales.get(_temp_segment(local_slot.hour), 1.0))
+                slot_time += timedelta(minutes=self.interval_minutes)
+            forecast = scaled
 
         return forecast
 
-    def _recent_load_scale(
+    def _recent_load_scales(
         self,
         history: list[tuple[datetime, float]],
         start_time: datetime,
-    ) -> float | None:
-        """Return a recent-regime multiplier when load has clearly shifted.
+    ) -> dict[str, float]:
+        """Return a per-segment recent-regime multiplier when load has shifted.
 
         The day/time pattern and weather model are deliberately still the base
         forecast. This multiplier catches step changes such as the first cold
-        snap of winter where the 30-day history is too slow to move.
+        snap of winter where the 30-day history is too slow to move. It is
+        computed independently per time-of-day segment (see _temp_segment): a
+        winter heating ramp lifts the overnight load far more than the midday
+        load, so a single global multiplier would dilute the overnight slots.
+
+        Returns a {segment: scale} mapping for the segments that have a clear,
+        well-covered shift; segments that are quiet (within the deadband) or
+        under-covered are simply absent (caller treats them as 1.0x).
         """
         if not history:
-            return None
+            return {}
 
         ref_time = dt_util.as_local(start_time) if start_time.tzinfo else start_time
         recent_end = ref_time
@@ -439,9 +471,6 @@ class LoadEstimator:
 
         older_pattern: dict[tuple[int, int, int], list[tuple[datetime, float]]] = defaultdict(list)
         recent_samples: list[tuple[datetime, float]] = []
-        actual_values: list[float] = []
-        expected_values: list[float] = []
-        matched_timestamps: list[datetime] = []
 
         # Single pass over the full history: bucket the older baseline samples
         # and collect the (much smaller) recent window. Converting each timestamp
@@ -459,6 +488,10 @@ class LoadEstimator:
             elif recent_start <= sample_time <= recent_end:
                 recent_samples.append((sample_time, value))
 
+        # Accumulate matched (actual, expected) pairs per segment.
+        seg_actual: dict[str, list[float]] = defaultdict(list)
+        seg_expected: dict[str, list[float]] = defaultdict(list)
+        seg_timestamps: dict[str, list[datetime]] = defaultdict(list)
         for sample_time, value in recent_samples:
             key = (
                 sample_time.weekday(),
@@ -473,36 +506,39 @@ class LoadEstimator:
             if expected is None or expected <= 0:
                 continue
 
-            actual_values.append(value)
-            expected_values.append(expected)
-            matched_timestamps.append(sample_time)
+            seg = _temp_segment(sample_time.hour)
+            seg_actual[seg].append(value)
+            seg_expected[seg].append(expected)
+            seg_timestamps[seg].append(sample_time)
 
-        matched_coverage = 0.0
-        if len(matched_timestamps) > 1:
-            matched_coverage = (
-                max(matched_timestamps) - min(matched_timestamps)
-            ).total_seconds() / 3600.0
+        scales: dict[str, float] = {}
+        for seg, actual_values in seg_actual.items():
+            timestamps = seg_timestamps[seg]
+            coverage = 0.0
+            if len(timestamps) > 1:
+                coverage = (max(timestamps) - min(timestamps)).total_seconds() / 3600.0
+            if coverage < RECENT_LOAD_MIN_COVERAGE_HOURS:
+                continue
 
-        if not actual_values or matched_coverage < RECENT_LOAD_MIN_COVERAGE_HOURS:
-            return None
+            recent_avg = sum(actual_values) / len(actual_values)
+            baseline_avg = sum(seg_expected[seg]) / len(seg_expected[seg])
+            ratio = recent_avg / baseline_avg
+            if abs(ratio - 1.0) < RECENT_LOAD_DEADBAND:
+                continue
 
-        recent_avg = sum(actual_values) / len(actual_values)
-        baseline_avg = sum(expected_values) / len(expected_values)
-        ratio = recent_avg / baseline_avg
-        if abs(ratio - 1.0) < RECENT_LOAD_DEADBAND:
-            return None
-
-        scale = 1.0 + (ratio - 1.0) * RECENT_LOAD_BLEND
-        scale = max(RECENT_LOAD_MIN_SCALE, min(RECENT_LOAD_MAX_SCALE, scale))
-        _LOGGER.info(
-            "Recent load regime adjustment: recent=%.0fW over %.1fh, "
-            "matched_history=%.0fW, scale=%.2fx",
-            recent_avg,
-            matched_coverage,
-            baseline_avg,
-            scale,
-        )
-        return scale
+            scale = 1.0 + (ratio - 1.0) * RECENT_LOAD_BLEND
+            scale = max(RECENT_LOAD_MIN_SCALE, min(RECENT_LOAD_MAX_SCALE, scale))
+            scales[seg] = scale
+            _LOGGER.info(
+                "Recent load regime adjustment [%s]: recent=%.0fW over %.1fh, "
+                "matched_history=%.0fW, scale=%.2fx",
+                seg,
+                recent_avg,
+                coverage,
+                baseline_avg,
+                scale,
+            )
+        return scales
 
     def _history_bucket_forecast(
         self,
@@ -639,25 +675,36 @@ class LoadEstimator:
         self,
         history: list[tuple[datetime, float]],
         horizon_hours: int,
-    ) -> tuple[list[tuple[datetime, float]] | None, dict | None, dict[str, float] | None]:
-        """Fetch temperature data and return (forecast_temps, bucket_temp_avgs, alpha).
+    ) -> tuple[
+        list[tuple[datetime, float]] | None,
+        dict | None,
+        dict[str, float] | None,
+        dict[str, float] | None,
+    ]:
+        """Fetch temperature data and return
+        (forecast_temps, bucket_temp_avgs, alpha, regime_temp_offset).
 
-        alpha is a per-segment mapping (see _temp_segment). Uses a 1-hour cache
-        for the fitted alpha.  Returns (None, None, None) if temperature data is
-        unavailable or no segment has a usable fit.
+        alpha and regime_temp_offset are per-segment mappings (see _temp_segment).
+        Uses a 1-hour cache for the fitted values.  Returns (None, None, None,
+        None) if temperature data is unavailable or no segment has a usable fit.
         """
         now = dt_util.utcnow()
 
-        # Use cached alpha if still warm (re-fetch forecast temps each time — cheap)
+        # Use cached fit if still warm (re-fetch forecast temps each time — cheap)
         if (
             self._temp_alpha_fitted
             and self._temp_cache_time
             and now - self._temp_cache_time < self._cache_duration
         ):
             if self._temp_alpha is None:
-                return None, None, None
+                return None, None, None, None
             forecast_temps = await self._fetch_forecast_temperatures(horizon_hours)
-            return forecast_temps or None, self._temp_bucket_averages, self._temp_alpha
+            return (
+                forecast_temps or None,
+                self._temp_bucket_averages,
+                self._temp_alpha,
+                self._temp_regime_offset,
+            )
 
         # Fetch historical temperatures matching the filtered load history
         # window used by the forecast model.
@@ -668,29 +715,31 @@ class LoadEstimator:
         if not temp_history:
             self._temp_alpha = None
             self._temp_bucket_averages = None
+            self._temp_regime_offset = None
             self._temp_alpha_fitted = True
             self._temp_cache_time = now
-            return None, None, None
+            return None, None, None, None
 
         # Bucketing the full load history (tens of thousands of points) and
         # fitting the sensitivity coefficient (a bisect per point) is heavy,
         # pure-CPU work. Run it off the event loop so it can't freeze HA during
         # the optimiser's first forecast at setup.
-        bucket_temp_avgs, alpha = await self.hass.async_add_executor_job(
+        bucket_temp_avgs, alpha, regime_offset = await self.hass.async_add_executor_job(
             self._compute_temperature_fit, history, temp_history
         )
 
         self._temp_alpha = alpha
         self._temp_bucket_averages = bucket_temp_avgs
+        self._temp_regime_offset = regime_offset
         self._temp_alpha_fitted = True
         self._temp_cache_time = now
 
         if alpha is None:
-            return None, None, None
+            return None, None, None, None
 
         # Fetch forecast temperatures
         forecast_temps = await self._fetch_forecast_temperatures(horizon_hours)
-        return forecast_temps or None, bucket_temp_avgs, alpha
+        return forecast_temps or None, bucket_temp_avgs, alpha, regime_offset
 
     async def _fetch_historical_temperatures(
         self,
@@ -856,7 +905,11 @@ class LoadEstimator:
         self,
         history: list[tuple[datetime, float]],
         temp_history: list[tuple[datetime, float]],
-    ) -> tuple[dict[tuple[int, int, int], float] | None, dict[str, float] | None]:
+    ) -> tuple[
+        dict[tuple[int, int, int], float] | None,
+        dict[str, float] | None,
+        dict[str, float] | None,
+    ]:
         """Bucket the load history and fit temperature sensitivity (executor-only).
 
         Iterates the full load history (tens of thousands of points) and runs a
@@ -875,7 +928,42 @@ class LoadEstimator:
         alpha = self._fit_temperature_sensitivity(
             history, temp_history, bucket_averages, bucket_temp_avgs
         )
-        return bucket_temp_avgs, alpha
+        regime_offset = self._compute_regime_temp_offset(temp_history, bucket_temp_avgs)
+        return bucket_temp_avgs, alpha, regime_offset
+
+    def _compute_regime_temp_offset(
+        self,
+        temp_history: list[tuple[datetime, float]],
+        bucket_temp_averages: dict[tuple[int, int, int], float],
+    ) -> dict[str, float] | None:
+        """Per-segment mean temperature anomaly over the recent window.
+
+        For each time-of-day segment, averages (recent_temp − slot_average_temp)
+        across the most recent RECENT_LOAD_WINDOW_HOURS of temperature history.
+        This is the bulk regime shift (e.g. a cold snap sitting several °C below
+        the 30-day norm) that _recent_load_scales already corrects for via actual
+        load. Subtracting it from the slot ΔT before applying α leaves α modelling
+        only the within-regime wiggle, so the two corrections don't double-count.
+        Returns None if there is no recent temperature data.
+        """
+        if not temp_history:
+            return None
+        window_start = max(ts for ts, _ in temp_history) - timedelta(
+            hours=RECENT_LOAD_WINDOW_HOURS
+        )
+        anomalies: dict[str, list[float]] = defaultdict(list)
+        for ts, temp_c in temp_history:
+            local_ts = dt_util.as_local(ts) if ts.tzinfo else ts
+            if local_ts < (dt_util.as_local(window_start) if window_start.tzinfo else window_start):
+                continue
+            key = (local_ts.weekday(), local_ts.hour, 0 if local_ts.minute < 30 else 1)
+            mu_temp = bucket_temp_averages.get(key)
+            if mu_temp is None:
+                continue
+            anomalies[_temp_segment(local_ts.hour)].append(temp_c - mu_temp)
+        if not anomalies:
+            return None
+        return {seg: sum(v) / len(v) for seg, v in anomalies.items()}
 
     def _fit_temperature_sensitivity(
         self,
@@ -976,6 +1064,7 @@ class LoadEstimator:
         self._history_cache.clear()
         self._cache_time = None
         self._temp_bucket_averages = None
+        self._temp_regime_offset = None
         self._temp_alpha_fitted = False
         self._temp_cache_time = None
 
